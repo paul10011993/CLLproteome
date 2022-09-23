@@ -1,0 +1,208 @@
+rm(list=ls())
+library(readxl)
+library(writexl)
+library(survival)
+library(lattice)
+library(splines)
+library(ggplot2)
+library(dplyr)
+library(survminer)
+library(scales)
+library(tidyverse)
+library(ggrepel)
+library(imputeLCMD)
+library(JointAI)
+library(pheatmap)
+library(genefilter)
+library(sva)
+library(pathfindR)
+library(ggbeeswarm)
+library(pROC)
+library(OptimalCutpoints)
+
+#load dataframes
+setwd('C://Users//marti//OneDrive//Documenten//Paul//Proteomics')
+df_proteom=read_excel("WD3_2286_06Da_rerun_Proteins.xlsx")
+Patient_characteristics<- read_excel("Patient_characteristics_updated.xlsx")
+Patient_characteristics$diag_date <- as.Date(Patient_characteristics$diag_date, origin = "1899-12-30")
+batch <- read_excel("Batch_proteomics.xlsx")
+Patient_characteristics <- merge(Patient_characteristics,batch)
+TMT <- read_excel("Batch_proteomics_TMT.xlsx")
+TMT$final <- paste0("F",TMT$Batch,".",TMT$code)
+'%ni%' <- Negate('%in%')
+corrected_values <- read.csv("corrected_abundances.csv")
+colnames(corrected_values)[colnames(corrected_values) %ni% TMT$final]
+corrected_values$X <- NULL
+corrected_values <- corrected_values[,order(colnames(corrected_values))]
+
+#make dataframe with one column with colnames corrected
+corrected_df <- data.frame(final = colnames(corrected_values)[colnames(corrected_values) %in% TMT$final])
+converted_df <- merge(corrected_df,TMT)
+converted_df <- cbind(converted_df,corrected_df)
+colnames(corrected_values) <- c("Accession",paste0("corrected_",converted_df$ID))
+df_proteom_corrected <- merge(df_proteom,corrected_values)
+df_proteom_corrected <- dplyr::select(df_proteom_corrected,-contains("pool"))
+is.na(df_proteom_corrected) <- do.call(cbind,lapply(df_proteom_corrected, is.infinite))
+
+#select for proteins with FDR>0.01
+df_proteom_FDR=subset(df_proteom_corrected, df_proteom$`Protein FDR Confidence: Combined`=="High")
+df_proteom_FDR[df_proteom_FDR == 0] <- NA
+df_proteom_FDR <- df_proteom_FDR[order(df_proteom_FDR$Master),]
+
+df_proteom_FDR <- df_proteom_FDR %>% distinct(`Gene Symbol`, .keep_all = T)
+
+Pat_char_short <- Patient_characteristics[,c("ID","IGHV_status","TP53","tri12_F","del17p_F","del11q_F","13q_F","det","Sex","Batch","R110")]
+
+df_proteom_FDRmaster_individual <- dplyr::select(df_proteom_FDR,contains("corrected"))
+long_df_samples <- dplyr::select(df_proteom_FDR,contains("Abundances (Normalized)"))
+long_df_samples  <- dplyr::select(long_df_samples , matches(", Ctrl_long,|, Case_long,"))
+ID_long_full <- str_sub(colnames(long_df_samples), start= -6)
+ID_long <- substr(ID_long_full,1,nchar(ID_long_full)-1)
+ID_long_total <- c(ID_long_full,ID_long)
+df_proteom_FDRmaster_individual <- dplyr::select(df_proteom_FDRmaster_individual, -paste0("corrected_",ID_long_full))
+
+df_proteom_FDRmaster_individual[df_proteom_FDRmaster_individual == 0] <- NA
+df_proteom_FDRmaster_individual$na_count <- apply(df_proteom_FDRmaster_individual, 1, function(x) sum(is.na(x)))
+df_proteom_selected <- df_proteom_FDR[which(df_proteom_FDRmaster_individual$na_count <50),]
+
+barplot(table(df_proteom_FDRmaster_individual$na_count))
+dev.off()
+
+df_proteom_FDRmaster_sel_ind <- dplyr::select(df_proteom_selected ,contains("corrected"))
+df_proteom_FDRmaster_sel_ind <- dplyr::select(df_proteom_FDRmaster_sel_ind, -paste0("corrected_",ID_long_full))
+
+caco_df_samples <- dplyr::select(df_proteom_FDR,contains("Abundances (Normalized)"))
+ctrl_df_samples  <- dplyr::select(caco_df_samples , matches(", Ctrl,"))
+case_df_samples  <- dplyr::select(caco_df_samples , matches(", Case,"))
+ID_case <- str_sub(colnames(case_df_samples), start= -5)
+ID_ctrl <- str_sub(colnames(ctrl_df_samples), start= -5)
+
+df_proteom_FDRmaster_cases <- dplyr::select(df_proteom_FDRmaster_sel_ind, paste0("corrected_",ID_case))
+df_proteom_FDRmaster_ctrls <- dplyr::select(df_proteom_FDRmaster_sel_ind, paste0("corrected_",ID_ctrl))
+
+df_t_tests <- df_proteom_FDRmaster_sel_ind
+
+df_anova <- as.data.frame(t(df_t_tests))
+df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)] <- paste0(df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)],"-dup")
+df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)] <- paste0(df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)],"2")
+df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)] <- paste0(df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)],"3")
+colnames(df_anova) <- df_proteom_selected$`Gene Symbol`
+
+vector_names <- gsub(".*_","",rownames(df_anova))
+rownames(df_anova) <- vector_names
+Pat_char_anova <- Patient_characteristics
+df_anova <- df_anova[ order(row.names(df_anova)), ]
+rownames(Pat_char_anova) <- Pat_char_anova$ID
+Pat_char_anova <- Pat_char_anova[ order(row.names(Pat_char_anova)), ]
+Pat_char_anova$TP53_17p <- ifelse(Pat_char_anova$TP53 == "mut"|Pat_char_anova$del17p_F == 1, "yes","no")
+
+batch = Pat_char_anova$Batch
+modcombat = model.matrix(~1, data=Pat_char_anova)
+
+set.seed(1)
+data_imputed <- impute.QRILC(df_anova)[[1]]
+
+for(i in 1:length(data_imputed)){
+  #get the minimum value before imputation
+  minimal_value_protein <- min(df_anova[,i],na.rm =T)
+  #get the negative values from the current column
+  neg_index <- which(data_imputed[,i] <0)
+  #replace all negative values for each protein with the minimal value before imputation
+  data_imputed[neg_index,i] <- minimal_value_protein
+}
+
+
+combat_edata = ComBat(dat=t(as.matrix(data_imputed)), batch=batch, mod=modcombat, par.prior=TRUE,prior.plots=TRUE)
+combat_data<- as.data.frame(t(combat_edata))
+
+
+temp_df <- df_proteom_selected
+temp_df <- temp_df[complete.cases(temp_df$`Gene Symbol`),]
+temp_df_samples <- dplyr::select(temp_df,contains("corrected"))
+temp_df_samples  <- dplyr::select(temp_df_samples , -paste0("corrected_",ID_long_full))
+transpose_temp_df <- as.data.frame(t(temp_df_samples))
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"-dup")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"2")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"3")
+colnames(transpose_temp_df) <- temp_df$`Gene Symbol`
+data_imputed <- impute.QRILC(transpose_temp_df)[[1]]
+
+corrected_abundances <- temp_df_samples
+colnames(corrected_abundances) <- gsub(".*_","",colnames(corrected_abundances))
+combat_abundances <- as.data.frame(combat_edata)
+corrected_abundances <- corrected_abundances[,order(names(corrected_abundances))]
+combat_abundances <- combat_abundances[,order(names(corrected_abundances))]
+all(colnames(combat_abundances) == colnames(corrected_abundances))
+
+
+test_na <- apply(corrected_abundances,2,is.na)
+
+summarize_na <- function(x) {
+  temp_x <- round(100 * sum(x) / length(x))
+  return(temp_x)
+}
+
+test_na_percent <- apply(test_na,2,summarize_na)
+
+original_samples <- dplyr::select(df_proteom_selected,contains("Abundances (Normalized)"))
+original_samples <- dplyr::select(original_samples,matches(", Case,|, Ctrl,"))
+
+corrected_abundances1 <- original_samples
+test1_na <- apply(corrected_abundances1,2,is.na)
+
+
+summarize_na <- function(x) {
+  temp_x <- round(100 * sum(x) / length(x))
+  return(temp_x)
+}
+
+test1_na_percent <- apply(test1_na,2,summarize_na)
+str_sub(names(test1_na_percent), start= -5)
+overview_before <- data.frame(test1_na_percent, names = str_sub(names(test1_na_percent), start= -5))
+overview_after <- data.frame(test_na_percent, names = gsub(".*_","",names(test_na_percent)))
+
+
+overview <- merge(overview_before,overview_after)
+overview <- overview[order(overview$names),]
+colnames(overview) <- c("ID","NA % before correction","NA % after correction")
+overview$'increase in NA by correction' <- overview$`NA % after correction`-overview$`NA % before correction`
+#write_xlsx(overview,"Missing_values.xlsx" )
+
+
+sd_corr <- apply(combat_abundances,1,sd, na.rm = T)
+mean_corr <- apply(combat_abundances,1,mean, na.rm = T)
+df_sd <- data.frame("mean" = mean_corr, "sd" = sd_corr)
+df_sd$sd_plus_2 <- df_sd$mean + 2*df_sd$sd
+df_sd$sd_min_2 <- df_sd$mean - 2*df_sd$sd
+
+
+#For each row, check if each value is greater than sd_plus_2 or smaller than sd_min_2
+corrected_abundances_sd <- combat_abundances
+for(i in 1:nrow(combat_abundances)){
+ greater_i<-  combat_abundances[i,] >  df_sd$sd_plus_2[i]
+ corrected_abundances_sd[i,] <- greater_i
+}
+
+corrected_abundances_sd_min <- combat_abundances
+for(i in 1:nrow(combat_abundances)){
+  smaller_i <-  combat_abundances[i,] <  df_sd$sd_min_2[i]
+  corrected_abundances_sd_min[i,] <- smaller_i
+}
+
+#count the number of 1's in each column
+summarize_sd <- function(x) {
+  temp_x <- round(100 * sum(x, na.rm = T) / length(x))
+  return(temp_x)
+}
+larger_sd_percent <- apply(corrected_abundances_sd,2,summarize_sd )
+smaller_sd_percent <- apply(corrected_abundances_sd_min,2,summarize_sd )
+
+overview_sd <- data.frame(larger_sd_percent, smaller_sd_percent, test_na_percent, names = gsub(".*_","",names(larger_sd_percent)))
+overview_sd$total <- overview_sd$larger_sd_percent + overview_sd$smaller_sd_percent
+overview_sd$summed_sd_miss <- overview_sd$total +overview_sd$test_na_percent 
+overview_sd <- overview_sd[order(overview_sd$summed_sd_miss, decreasing = T),]
+overview_sd$names <- as.factor(overview_sd$names)
+positions <- as.character(overview_sd$names)
+
+ggplot(data=overview_sd, aes(x=names, y=summed_sd_miss)) +
+  geom_bar(stat="identity", fill="steelblue")+ scale_x_discrete(limits = positions)+ theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
