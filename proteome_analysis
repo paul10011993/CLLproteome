@@ -1,0 +1,2052 @@
+rm(list=ls())
+library(readxl)
+library(writexl)
+library(survival)
+library(lattice)
+library(splines)
+library(ggplot2)
+library(dplyr)
+library(survminer)
+library(scales)
+library(tidyverse)
+library(ggrepel)
+library(imputeLCMD)
+library(JointAI)
+library(pheatmap)
+library(genefilter)
+library(sva)
+library(pathfindR)
+library(ggbeeswarm)
+library(pROC)
+library(OptimalCutpoints)
+
+setwd('C://Users//marti//OneDrive//Documenten//Paul//Proteomics')
+df_proteom=read_excel("WD3_2286_06Da_rerun_Proteins.xlsx")
+#Exclude patient samples from dataset that failed quality control
+df_proteom <-dplyr::select(df_proteom, !matches(c("028CO","032CA","008CA","004CO","037CA")))
+
+#Remove patients from annotating data that failed quality control
+Patient_characteristics<- read_excel("Patient_characteristics_updated.xlsx")
+Patient_characteristics <- Patient_characteristics[Patient_characteristics$ID != "028CO",]
+Patient_characteristics <- Patient_characteristics[Patient_characteristics$ID != "008CA",]
+Patient_characteristics <- Patient_characteristics[Patient_characteristics$ID != "004CO",]
+Patient_characteristics <- Patient_characteristics[Patient_characteristics$ID != "032CA",]
+Patient_characteristics <- Patient_characteristics[Patient_characteristics$ID != "037CA",]
+Patient_characteristics$diag_date <- as.Date(Patient_characteristics$diag_date, origin = "1899-12-30")
+#Add information about batch to annotating information
+batch <- read_excel("Batch_proteomics.xlsx")
+Patient_characteristics <- merge(Patient_characteristics,batch)
+TMT <- read_excel("Batch_proteomics_TMT.xlsx")
+TMT$final <- paste0("F",TMT$Batch,".",TMT$code)
+'%ni%' <- Negate('%in%')
+
+#Load mass spec data with Batch correction
+corrected_values <- read.csv("corrected_abundances.csv")
+colnames(corrected_values)[colnames(corrected_values) %ni% TMT$final]
+corrected_values$X <- NULL
+corrected_values <- corrected_values[,order(colnames(corrected_values))]
+
+#Exclude patient samples from dataset that failed quality control
+corrected_df <- data.frame(final = colnames(corrected_values)[colnames(corrected_values) %in% TMT$final])
+converted_df <- merge(corrected_df,TMT)
+converted_df <- cbind(converted_df,corrected_df)
+colnames(corrected_values) <- c("Accession",paste0("corrected_",converted_df$ID))
+df_proteom_corrected <- merge(df_proteom,corrected_values)
+df_proteom_corrected <- dplyr::select(df_proteom_corrected,-contains("pool"))
+is.na(df_proteom_corrected) <- do.call(cbind,lapply(df_proteom_corrected, is.infinite))
+
+df_proteom_corrected <-dplyr::select(df_proteom_corrected, !matches(c("028CO","008CA","004CO","032CA","037CA")))
+
+#select for proteins with FDR>0.01
+df_proteom_FDR=subset(df_proteom_corrected, df_proteom$`Protein FDR Confidence: Combined`=="High")
+df_proteom_FDR[df_proteom_FDR == 0] <- NA
+df_proteom_FDR <- df_proteom_FDR[order(df_proteom_FDR$Master),]
+
+#remove duplicate entries
+df_proteom_FDR <- df_proteom_FDR %>% distinct(`Gene Symbol`, .keep_all = T)
+
+Pat_char_short <- Patient_characteristics[,c("ID","IGHV_status","TP53","tri12_F","del17p_F","del11q_F","13q_F","det","Sex","Batch","R110")]
+Pat_char_short$IGHV_status[Pat_char_short$det == 0]
+table(Patient_characteristics$IGHV_status,Patient_characteristics$det)
+table(Patient_characteristics$tri12_F,Patient_characteristics$det)
+table(Patient_characteristics$TP53,Patient_characteristics$det)
+table(Patient_characteristics$del17p_F,Patient_characteristics$det)
+table(Patient_characteristics$TP53,Patient_characteristics$del17p_F)
+
+#Select the relevant patient samples for the study
+df_proteom_FDRmaster_individual <- dplyr::select(df_proteom_FDR,contains("corrected"))
+long_df_samples <- dplyr::select(df_proteom_FDR,contains("Abundances (Normalized)"))
+long_df_samples  <- dplyr::select(long_df_samples , matches(", Ctrl_long,|, Case_long,"))
+ID_long_full <- str_sub(colnames(long_df_samples), start= -6)
+ID_long <- substr(ID_long_full,1,nchar(ID_long_full)-1)
+ID_long_total <- c(ID_long_full,ID_long)
+df_proteom_FDRmaster_individual <- dplyr::select(df_proteom_FDRmaster_individual, -paste0("corrected_",ID_long_full))
+
+#Set proteins with abundance of 0 to missing
+df_proteom_FDRmaster_individual[df_proteom_FDRmaster_individual == 0] <- NA
+df_proteom_FDRmaster_individual$na_count <- apply(df_proteom_FDRmaster_individual, 1, function(x) sum(is.na(x)))
+#select proteins that are missing in less than 50% of individuals
+df_proteom_selected <- df_proteom_FDR[which(df_proteom_FDRmaster_individual$na_count <50),]
+
+df_proteom_FDRmaster_sel_ind <- dplyr::select(df_proteom_selected ,contains("corrected"))
+df_proteom_FDRmaster_sel_ind <- dplyr::select(df_proteom_FDRmaster_sel_ind, -paste0("corrected_",ID_long_full))
+
+caco_df_samples <- dplyr::select(df_proteom_FDR,contains("Abundances (Normalized)"))
+ctrl_df_samples  <- dplyr::select(caco_df_samples , matches(", Ctrl,"))
+case_df_samples  <- dplyr::select(caco_df_samples , matches(", Case,"))
+ID_case <- str_sub(colnames(case_df_samples), start= -5)
+ID_ctrl <- str_sub(colnames(ctrl_df_samples), start= -5)
+
+df_proteom_FDRmaster_cases <- dplyr::select(df_proteom_FDRmaster_sel_ind, paste0("corrected_",ID_case))
+df_proteom_FDRmaster_ctrls <- dplyr::select(df_proteom_FDRmaster_sel_ind, paste0("corrected_",ID_ctrl))
+
+df_t_tests <- df_proteom_FDRmaster_sel_ind
+df_anova <- as.data.frame(t(df_t_tests))
+
+df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)] <- paste0(df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)],"-dup")
+df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)] <- paste0(df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)],"2")
+df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)] <- paste0(df_proteom_selected$`Gene Symbol`[duplicated(df_proteom_selected$`Gene Symbol`)],"3")
+
+colnames(df_anova) <- df_proteom_selected$`Gene Symbol`
+
+#prepare data and annotating information for two way anova comparisons
+vector_names <- gsub(".*_","",rownames(df_anova))
+rownames(df_anova) <- vector_names
+Pat_char_anova <- Patient_characteristics
+df_anova <- df_anova[ order(row.names(df_anova)), ]
+rownames(Pat_char_anova) <- Pat_char_anova$ID
+Pat_char_anova <- Pat_char_anova[ order(row.names(Pat_char_anova)), ]
+Pat_char_anova$TP53_17p <- ifelse(Pat_char_anova$TP53 == "mut"|Pat_char_anova$del17p_F == 1, "yes","no")
+
+#correct for batch effects
+batch = Pat_char_anova$Batch
+modcombat = model.matrix(~1, data=Pat_char_anova)
+
+#impute missing data
+set.seed(1)
+data_imputed <- impute.QRILC(df_anova)[[1]]
+
+for(i in 1:length(data_imputed)){
+  #get the minimum value before imputation
+  minimal_value_protein <- min(df_anova[,i],na.rm =T)
+  #get the negative values from the current column
+  neg_index <- which(data_imputed[,i] <0)
+  #replace all negative values for each protein with the minimal value before imputation
+  data_imputed[neg_index,i] <- minimal_value_protein
+}
+
+combat_edata = ComBat(dat=t(as.matrix(data_imputed)), batch=batch, mod=modcombat, par.prior=TRUE,prior.plots=TRUE)
+combat_data<- as.data.frame(t(combat_edata))
+
+Pat_char_anova$Batch <- as.factor(Pat_char_anova$Batch)
+
+
+#perform a two way anova for each protein by Batch and outcome (det)
+result_anova <- data.frame("Protein" = colnames(df_anova), p_value = NA, p_value_mut = NA )
+for(i in 1:length(df_anova)){
+  if (all(row.names(Pat_char_anova) == row.names(df_anova)) == F)
+  {
+   stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova,df_anova[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~ Batch + det, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][2]
+  result_anova[i, 2] <- first_res
+}
+
+df_proteom_selected$pValues <- result_anova$p_value
+
+#calculate fold change
+#set negative values to 0
+combat_edata[combat_edata < 0] <- 0
+combat_cases <- dplyr::select(as.data.frame(combat_edata), contains("Ca"))
+combat_ctrls <- dplyr::select(as.data.frame(combat_edata), contains("Co"))
+row_means_ctrl <- rowMeans(combat_ctrls, na.rm = T)
+#to avoid dividing by 0, set 0 values to a low number 
+row_means_ctrl[row_means_ctrl == 0] <- 300
+row_means_cases <- rowMeans(combat_cases, na.rm = T)
+row_means_cases[row_means_cases == 0] <- 300
+abundance_ratio <- row_means_cases/row_means_ctrl
+abundance_ratio_co_ca <- row_means_ctrl/row_means_cases
+df_proteom_selected$Case_Control_Ratio <- abundance_ratio
+df_proteom_selected$Control_Case_Ratio <- abundance_ratio_co_ca
+df_proteom_selected$Log2FC_Co_Ca <- log2(df_proteom_selected$Case_Control_Ratio)
+
+#FDR adjust the P-values
+df_proteom_selected$p_adj <- p.adjust(df_proteom_selected$pValues, method = "fdr", n = length(df_proteom_selected$pValues))
+
+#Find proteins with an adjusted P-value above 0.05 and a log2(Fold change) > 0.5 or smaller than -0.5
+sign_markers <- df_proteom_selected$`Gene Symbol`[df_proteom_selected$p_adj <= 0.05 & df_proteom_selected$Log2FC_Co_Ca >= 0.5 |df_proteom_selected$p_adj <= 0.05 & df_proteom_selected$Log2FC_Co_Ca <= -0.5]
+sign_FC <- df_proteom_selected$Case_Control_Ratio[df_proteom_selected$p_adj <= 0.05 & df_proteom_selected$Log2FC_Co_Ca >= 0.5 |df_proteom_selected$p_adj <= 0.05 & df_proteom_selected$Log2FC_Co_Ca <= -0.5]
+sign_p_adj <- df_proteom_selected$p_adj[df_proteom_selected$p_adj <= 0.05 & df_proteom_selected$Log2FC_Co_Ca >= 0.5 |df_proteom_selected$p_adj <= 0.05 & df_proteom_selected$Log2FC_Co_Ca <= -0.5]
+#write_xlsx(as.data.frame(cbind(sign_markers,sign_FC,sign_p_adj)), "sign_hits_CaCo.xlsx") 
+
+#make a volcano plot for the results
+ggplot(df_proteom_selected, aes(x = Log2FC_Co_Ca, y = -log10(p_adj),color = ifelse(p_adj<0.05& (Log2FC_Co_Ca > 0.5 | Log2FC_Co_Ca < - 0.5 ),"red","grey"))) +
+  geom_point(aes(alpha = ifelse(p_adj<0.05& (Log2FC_Co_Ca > 0.5 | Log2FC_Co_Ca < - 0.5 ),1,0.01),size = ifelse(p_adj<0.05& (Log2FC_Co_Ca > 0.5 | Log2FC_Co_Ca < - 0.5 ),0.51,0.5) ),show.legend = F) +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  geom_vline(
+    xintercept = c(0.5),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  geom_vline(
+    xintercept = c(-0.5),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  theme(axis.text=element_text(size=12))+
+  scale_size(range = c(1.75,2.5))+
+  scale_alpha(range = c(0.4,1))+
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected, p_adj < 0.05& (Log2FC_Co_Ca > 0.5 | Log2FC_Co_Ca < - 0.5 )),
+                  aes(Log2FC_Co_Ca, -log10(p_adj), label = `Gene Symbol`, fontface = "bold"),size = 4, color="steelblue")
+  
+#ggsave("Volcano_CaCo.eps", device=cairo_ps )
+
+
+#cases vs controls, unmutated only
+IGHV_mutated_ID <- Pat_char_anova$ID[Pat_char_anova$IGHV_status == "mutated" & !is.na(Pat_char_anova$IGHV_status)]
+df_mutated <- df_anova[row.names(df_anova)%in% IGHV_mutated_ID,]
+Pat_char_mutated <- Pat_char_anova[row.names(Pat_char_anova)%in% IGHV_mutated_ID,]
+
+result_mutated <- data.frame("Protein" = colnames(df_mutated), p_value_CaCo_mut = NA )
+for(i in 1:length(df_mutated)){
+  anova_i <- cbind(Pat_char_mutated,df_mutated[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~ Batch + det, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][2]
+  result_mutated[i, 2] <- first_res
+}
+df_proteom_selected$pValues_mut <- result_mutated$p_value_CaCo_mut
+combat_cases_mut <- combat_cases[row.names(combat_cases)%in% IGHV_mutated_ID,]
+combat_ctrls_mut <- combat_ctrls[row.names(combat_ctrls)%in% IGHV_mutated_ID,]
+
+row_means_ctrl_mut <- rowMeans(combat_ctrls_mut, na.rm = T)
+row_means_ctrl_mut[row_means_ctrl_mut == 0] <- 300
+row_means_cases_mut <- rowMeans(combat_cases_mut, na.rm = T)
+row_means_cases_mut[row_means_cases_mut == 0] <- 300
+abundance_ratio_mut <- row_means_cases_mut/row_means_ctrl_mut
+df_proteom_selected$Case_Control_Ratio_mut <- abundance_ratio
+df_proteom_selected$Log2FC_Co_Ca_mut <- log2(df_proteom_selected$Case_Control_Ratio_mut)
+df_proteom_selected$p_adj_mut <- p.adjust(df_proteom_selected$pValues_mut, method = "fdr", n = length(df_proteom_selected$pValues_mut))
+
+
+ggplot(df_proteom_selected, aes(x = Log2FC_Co_Ca_mut, y = -log10(p_adj_mut),color = ifelse(p_adj_mut<0.05& (Log2FC_Co_Ca_mut > 0.5 | Log2FC_Co_Ca_mut < - 0.5 ),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected, p_adj_mut < 0.05& (Log2FC_Co_Ca_mut > 0.5 | Log2FC_Co_Ca_mut < - 0.5 )),
+                  aes(Log2FC_Co_Ca_mut, -log10(p_adj_mut), label = `Gene Symbol`),size = 3, color="steelblue")
+
+result_anova <- data.frame("Protein" = colnames(df_anova), p_value = NA, p_value_mut = NA )
+for(i in 1:length(df_anova)){
+  if (all(row.names(Pat_char_anova) == row.names(df_anova)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova,df_anova[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~ det + Batch + IGHV_status, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][1]
+  result_anova[i, 2] <- first_res
+}
+df_proteom_selected$pValues <- result_anova$p_value
+combat_edata[combat_edata < 0] <- 0
+combat_cases <- dplyr::select(as.data.frame(combat_edata), contains("Ca"))
+combat_ctrls <- dplyr::select(as.data.frame(combat_edata), contains("Co"))
+min(combat_cases)
+row_means_ctrl <- rowMeans(combat_ctrls, na.rm = T)
+row_means_ctrl[row_means_ctrl == 0] <- 300
+row_means_cases <- rowMeans(combat_cases, na.rm = T)
+row_means_cases[row_means_cases == 0] <- 300
+abundance_ratio <- row_means_cases/row_means_ctrl
+abundance_ratio_co_ca <- row_means_ctrl/row_means_cases
+df_proteom_selected$Case_Control_Ratio <- abundance_ratio
+df_proteom_selected$Control_Case_Ratio <- abundance_ratio_co_ca
+df_proteom_selected$Log2FC_Co_Ca <- log2(df_proteom_selected$Case_Control_Ratio)
+df_proteom_selected$p_adj <- p.adjust(df_proteom_selected$pValues, method = "fdr", n = length(df_proteom_selected$pValues))
+
+ggplot(df_proteom_selected, aes(x = Log2FC_Co_Ca, y = -log10(p_adj),color = ifelse(p_adj<0.05& (Log2FC_Co_Ca > 0.5 | Log2FC_Co_Ca < - 0.5 ),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected, p_adj < 0.05& (Log2FC_Co_Ca > 0.5 | Log2FC_Co_Ca < - 0.5 )),
+                  aes(Log2FC_Co_Ca, -log10(p_adj), label = `Gene Symbol`),size = 3, color="steelblue")
+
+df_R110 <- df_proteom_FDRmaster_sel_ind
+
+R110 <- Pat_char_short$ID[Pat_char_short$R110 == "R110" ]
+not_R110 <- Pat_char_short$ID[Pat_char_short$R110 == "No" ]
+
+df_R110_y <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% R110)])
+df_R110_n <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% not_R110)])
+
+df_R110_y2 <- df_R110[,which(str_sub(colnames(df_R110), start= -5) %in% R110)]
+df_R110_n2 <- df_R110[,which(str_sub(colnames(df_R110), start= -5) %in% not_R110)]
+
+row_means_R110 <- rowMeans(df_R110_y)
+row_means_R110[row_means_R110 == 0] <- 300
+row_means_R110_n <- rowMeans(df_R110_n)
+row_means_R110_n [row_means_R110_n  == 0] <- 300
+
+abundance_ratio_R110 <- row_means_R110/row_means_R110_n
+df_proteom_selected$Ratio_R110 <- abundance_ratio_R110
+df_proteom_selected$Log2FC_R110 <- log2(df_proteom_selected$Ratio_R110) 
+
+df_t_tests_R110<- df_t_tests
+
+df_R110_y_na_count <- apply(df_R110_y2, 1, function(x) sum(is.na(x)))
+
+df_proteom_selected_R110 <- df_proteom_selected
+
+df_proteom_selected_R110 <- df_proteom_selected_R110[-which(df_R110_y_na_count >= 5),]
+
+df_t_tests_R110 <- df_t_tests_R110[-which(df_R110_y_na_count >=5),]
+
+df_R110 <- df_R110[-which(df_R110_y_na_count >= 5),]
+df_anova_R110 <- as.data.frame(t(df_t_tests_R110))
+
+df_proteom_selected_R110$`Gene Symbol`[duplicated(df_proteom_selected_R110$`Gene Symbol`)] <- paste0(df_proteom_selected_R110$`Gene Symbol`[duplicated(df_proteom_selected_R110$`Gene Symbol`)],"-dup")
+df_proteom_selected_R110$`Gene Symbol`[duplicated(df_proteom_selected_R110$`Gene Symbol`)] <- paste0(df_proteom_selected_R110$`Gene Symbol`[duplicated(df_proteom_selected_R110$`Gene Symbol`)],"2")
+df_proteom_selected_R110$`Gene Symbol`[duplicated(df_proteom_selected_R110$`Gene Symbol`)] <- paste0(df_proteom_selected_R110$`Gene Symbol`[duplicated(df_proteom_selected_R110$`Gene Symbol`)],"3")
+colnames(df_anova_R110) <- df_proteom_selected_R110$`Gene Symbol`
+
+vector_names <- gsub(".*_","",rownames(df_anova_R110))
+rownames(df_anova_R110) <- vector_names
+df_anova_R110 <- df_anova_R110[ order(row.names(df_anova_R110)), ]
+
+result_anova_R110 <- data.frame("Protein" = colnames(df_anova_R110), p_value = NA )
+for(i in 1:length(df_anova_R110)){
+  if (all(row.names(Pat_char_anova) == row.names(df_anova_R110)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova,df_anova_R110[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~ Batch +R110, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][2]
+  result_anova_R110[i, 2] <- first_res
+}
+
+df_proteom_selected_R110$pValues_R110 <- result_anova_R110$p_value
+
+df_proteom_selected_R110$p_adj <- p.adjust(df_proteom_selected_R110$pValues_R110, method = "fdr", n = length(df_proteom_selected_R110$pValues_R110))
+
+sign_markers_R110 <- df_proteom_selected_R110$`Gene Symbol`[df_proteom_selected_R110$p_adj <= 0.05 & df_proteom_selected_R110$Log2FC_R110 >= 0.5 |df_proteom_selected_R110$p_adj <= 0.05 & df_proteom_selected_R110$Log2FC_R110 <= -0.5]
+sign_FC_R110 <- df_proteom_selected_R110$Ratio_R110[df_proteom_selected_R110$p_adj <= 0.05 & df_proteom_selected_R110$Log2FC_R110 >= 0.5 |df_proteom_selected_R110$p_adj <= 0.05 & df_proteom_selected_R110$Log2FC_R110 <= -0.5]
+sign_p_adj_R110 <- df_proteom_selected_R110$p_adj[df_proteom_selected_R110$p_adj <= 0.05 & df_proteom_selected_R110$Log2FC_R110 >= 0.5 |df_proteom_selected_R110$p_adj <= 0.05 & df_proteom_selected_R110$Log2FC_R110 <= -0.5]
+#write_xlsx(as.data.frame(cbind(sign_markers_R110,sign_FC_R110,sign_p_adj_R110)), "sign_hits_R110.xlsx") 
+
+ggplot(df_proteom_selected_R110, aes(x = Log2FC_R110, y = -log10(p_adj),color = ifelse(p_adj<0.05& (Log2FC_R110 > 0.5 | Log2FC_R110 < - 0.5 ),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_R110, p_adj < 0.05& (Log2FC_R110 > 0.5 | Log2FC_R110 < - 0.5 )),
+                  aes(Log2FC_R110, -log10(p_adj), label = `Gene Symbol`),size = 3, color="steelblue")
+
+#R110 vs mut
+df_R110_mut <- df_proteom_FDRmaster_sel_ind
+
+R110 <- Pat_char_short$ID[Pat_char_short$R110 == "R110" ]
+not_R110 <- Pat_char_short$ID[Pat_char_short$R110 == "No" ]
+
+IGHV_mutated_ID <- Pat_char_anova$ID[Pat_char_anova$IGHV_status == "mutated" & !is.na(Pat_char_anova$IGHV_status)]
+df_R110_mut <- df_anova[row.names(df_anova)%in% IGHV_mutated_ID |row.names(df_anova) %in% R110,]
+df_R110_only <- df_R110_mut[row.names(df_R110_mut) %in% R110,]
+df_R110_mut_only <- df_R110_mut[row.names(df_R110_mut) %ni% R110,]
+
+df_R110_y <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% R110)])
+df_R110_n_mut <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% row.names(df_R110_mut_only))])
+
+df_R110_y2 <- df_R110[,which(str_sub(colnames(df_R110), start= -5) %in% R110)]
+df_R110_n2 <- df_R110[,which(str_sub(colnames(df_R110), start= -5) %in% not_R110)]
+
+row_means_R110 <- rowMeans(df_R110_y)
+row_means_R110[row_means_R110 == 0] <- 300
+row_means_R110_n_mut <- rowMeans(df_R110_n_mut)
+row_means_R110_n_mut[row_means_R110_n_mut == 0] <- 300
+
+abundance_ratio_R110_mut <- row_means_R110/row_means_R110_n_mut
+df_proteom_selected$Ratio_R110_mut <- abundance_ratio_R110_mut
+df_proteom_selected$Log2FC_R110_mut <- log2(df_proteom_selected$Ratio_R110_mut) 
+
+df_t_tests_R110_mut <- df_t_tests
+
+df_R110_y_na_count <- apply(df_R110_y2, 1, function(x) sum(is.na(x)))
+
+df_proteom_selected_R110_mut <- df_proteom_selected
+df_proteom_selected_R110_mut <- df_proteom_selected_R110_mut[-which(df_R110_y_na_count >= 5),]
+
+df_t_tests_R110_mut <- df_t_tests_R110_mut[-which(df_R110_y_na_count >=5),]
+
+df_R110_mut <- df_R110_mut[-which(df_R110_y_na_count >= 5),]
+
+df_anova_R110_mut <- as.data.frame(t(df_t_tests_R110_mut))
+
+df_proteom_selected_R110_mut$`Gene Symbol`[duplicated(df_proteom_selected_R110_mut$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_mut$`Gene Symbol`[duplicated(df_proteom_selected_R110_mut$`Gene Symbol`)],"-dup")
+df_proteom_selected_R110_mut$`Gene Symbol`[duplicated(df_proteom_selected_R110_mut$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_mut$`Gene Symbol`[duplicated(df_proteom_selected_R110_mut$`Gene Symbol`)],"2")
+df_proteom_selected_R110_mut$`Gene Symbol`[duplicated(df_proteom_selected_R110_mut$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_mut$`Gene Symbol`[duplicated(df_proteom_selected_R110_mut$`Gene Symbol`)],"3")
+colnames(df_anova_R110_mut) <- df_proteom_selected_R110_mut$`Gene Symbol`
+
+vector_names <- gsub(".*_","",rownames(df_anova_R110_mut))
+rownames(df_anova_R110_mut) <- vector_names
+df_anova_R110_mut <- df_anova_R110_mut[ order(row.names(df_anova_R110_mut)), ]
+df_anova_R110_mut  <- df_anova_R110_mut [row.names(df_anova_R110_mut ) %in% row.names(df_R110_mut),]
+df_anova_R110_mut <- df_anova_R110_mut[ order(row.names(df_anova_R110_mut)), ]
+
+Pat_char_anova_R110_mut <- Pat_char_anova[row.names(Pat_char_anova) %in% row.names(df_R110_mut),]
+Pat_char_anova_R110_mut <- Pat_char_anova_R110_mut[ order(row.names(Pat_char_anova_R110_mut)), ]
+
+result_anova_R110_mut <- data.frame("Protein" = colnames(df_anova_R110_mut), p_value = NA )
+for(i in 1:length(df_anova_R110_mut)){
+  if (all(row.names(Pat_char_anova_R110_mut) == row.names(df_anova_R110_mut)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova_R110_mut,df_anova_R110_mut[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~ R110 + Batch, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][1]
+  result_anova_R110_mut[i, 2] <- first_res
+}
+
+df_proteom_selected_R110_mut$pValues_R110 <- result_anova_R110_mut$p_value
+
+df_proteom_selected_R110_mut$p_adj <- p.adjust(df_proteom_selected_R110_mut$pValues_R110, method = "fdr", n = length(df_proteom_selected_R110_mut$pValues_R110))
+
+df_proteom_selected_R110_mut$p_adj[df_proteom_selected_R110_mut$`Gene Symbol` == "ZAP70"] 
+df_proteom_selected_R110_mut$Log2FC_R110_mut[df_proteom_selected_R110_mut$`Gene Symbol` == "ZAP70"] 
+
+ggplot(df_proteom_selected_R110_mut, aes(x = Log2FC_R110_mut, y = -log10(p_adj),color = ifelse(p_adj<0.05& (Log2FC_R110_mut > 0.5 | Log2FC_R110_mut < - 0.5 ),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_R110_mut, p_adj < 0.05 & (Log2FC_R110_mut > 0.5 | Log2FC_R110_mut < - 0.5 )),
+                  aes(Log2FC_R110_mut, -log10(p_adj), label = `Gene Symbol`),size = 3, color="steelblue")
+
+#R110 vs unmutated only
+
+df_R110_unmut <- df_proteom_FDRmaster_sel_ind
+
+R110 <- Pat_char_short$ID[Pat_char_short$R110 == "R110" ]
+not_R110 <- Pat_char_short$ID[Pat_char_short$R110 == "No" ]
+
+IGHV_unmutated_ID <- Pat_char_anova$ID[Pat_char_anova$IGHV_status == "unmutated" & !is.na(Pat_char_anova$IGHV_status)]
+df_R110_unmut <- df_anova[row.names(df_anova)%in% IGHV_unmutated_ID |row.names(df_anova) %in% R110,]
+df_R110_only <- df_R110_mut[row.names(df_R110_mut) %in% R110,]
+df_R110_unmut_only <- df_R110_unmut[row.names(df_R110_unmut) %ni% R110,]
+
+df_R110_y <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% R110)])
+df_R110_n_unmut <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% row.names(df_R110_unmut_only))])
+
+df_R110_y2 <- df_R110[,which(str_sub(colnames(df_R110), start= -5) %in% R110)]
+df_R110_n2 <- df_R110[,which(str_sub(colnames(df_R110), start= -5) %in% not_R110)]
+
+row_means_R110 <- rowMeans(df_R110_y)
+row_means_R110[row_means_R110 == 0] <- 300
+row_means_R110_n_unmut <- rowMeans(df_R110_n_unmut)
+row_means_R110_n_unmut[row_means_R110_n_unmut == 0] <- 300
+
+abundance_ratio_R110_unmut <- row_means_R110/row_means_R110_n_unmut
+df_proteom_selected$Ratio_R110_unmut <- abundance_ratio_R110_unmut
+df_proteom_selected$Log2FC_R110_unmut <- log2(df_proteom_selected$Ratio_R110_unmut) 
+
+df_t_tests_R110_unmut <- df_t_tests
+
+df_R110_y_na_count <- apply(df_R110_y2, 1, function(x) sum(is.na(x)))
+
+df_proteom_selected_R110_unmut <- df_proteom_selected
+df_proteom_selected_R110_unmut <- df_proteom_selected_R110_unmut[-which(df_R110_y_na_count >= 5),]
+
+df_t_tests_R110_unmut <- df_t_tests_R110_unmut[-which(df_R110_y_na_count >=5),]
+
+df_R110_unmut <- df_R110_unmut[-which(df_R110_y_na_count >= 5),]
+
+df_anova_R110_unmut <- as.data.frame(t(df_t_tests_R110_unmut))
+
+df_proteom_selected_R110_unmut$`Gene Symbol`[duplicated(df_proteom_selected_R110_unmut$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_unmut$`Gene Symbol`[duplicated(df_proteom_selected_R110_unmut$`Gene Symbol`)],"-dup")
+df_proteom_selected_R110_unmut$`Gene Symbol`[duplicated(df_proteom_selected_R110_unmut$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_unmut$`Gene Symbol`[duplicated(df_proteom_selected_R110_unmut$`Gene Symbol`)],"2")
+df_proteom_selected_R110_unmut$`Gene Symbol`[duplicated(df_proteom_selected_R110_unmut$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_unmut$`Gene Symbol`[duplicated(df_proteom_selected_R110_unmut$`Gene Symbol`)],"3")
+colnames(df_anova_R110_unmut) <- df_proteom_selected_R110_unmut$`Gene Symbol`
+
+vector_names <- gsub(".*_","",rownames(df_anova_R110_unmut))
+rownames(df_anova_R110_unmut) <- vector_names
+df_anova_R110_unmut <- df_anova_R110_unmut[ order(row.names(df_anova_R110_unmut)), ]
+df_anova_R110_unmut  <- df_anova_R110_unmut [row.names(df_anova_R110_unmut ) %in% row.names(df_R110_unmut),]
+df_anova_R110_unmut <- df_anova_R110_unmut[ order(row.names(df_anova_R110_unmut)), ]
+
+Pat_char_anova_R110_unmut <- Pat_char_anova[row.names(Pat_char_anova) %in% row.names(df_R110_unmut),]
+Pat_char_anova_R110_unmut <- Pat_char_anova_R110_unmut[ order(row.names(Pat_char_anova_R110_unmut)), ]
+
+result_anova_R110_unmut <- data.frame("Protein" = colnames(df_anova_R110_unmut), p_value = NA )
+for(i in 1:length(df_anova_R110_unmut)){
+  if (all(row.names(Pat_char_anova_R110_unmut) == row.names(df_anova_R110_unmut)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova_R110_unmut,df_anova_R110_unmut[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~ R110 + Batch, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][1]
+  result_anova_R110_unmut[i, 2] <- first_res
+}
+
+df_proteom_selected_R110_unmut$pValues_R110 <- result_anova_R110_unmut$p_value
+
+df_proteom_selected_R110_unmut$p_adj <- p.adjust(df_proteom_selected_R110_unmut$pValues_R110, method = "fdr", n = length(df_proteom_selected_R110_unmut$pValues_R110))
+
+df_proteom_selected_R110_unmut$p_adj[df_proteom_selected_R110_unmut$`Gene Symbol` == "ZAP70"] 
+df_proteom_selected_R110_unmut$Log2FC_R110_mut[df_proteom_selected_R110_unmut$`Gene Symbol` == "ZAP70"] 
+
+ggplot(df_proteom_selected_R110_unmut, aes(x = Log2FC_R110_unmut, y = -log10(p_adj),color = ifelse(p_adj<0.05& (Log2FC_R110_unmut > 0.5 | Log2FC_R110_unmut < - 0.5 ),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_R110_unmut, p_adj < 0.05 & (Log2FC_R110_unmut > 0.5 | Log2FC_R110_unmut < - 0.5 )),
+                  aes(Log2FC_R110_unmut, -log10(p_adj), label = `Gene Symbol`),size = 3, color="steelblue")
+
+#R110 vs cases
+
+df_R110_cases <- df_proteom_FDRmaster_sel_ind
+
+R110 <- Pat_char_short$ID[Pat_char_short$R110 == "R110" ]
+not_R110 <- Pat_char_short$ID[Pat_char_short$R110 == "No" ]
+
+cases_ID <- Pat_char_anova$ID[Pat_char_anova$det == "1"]
+df_R110_cases <- df_anova[row.names(df_anova)%in% cases_ID |row.names(df_anova) %in% R110,]
+df_R110_only <- df_R110_cases[row.names(df_R110_cases) %in% R110,]
+df_R110_cases_only <- df_R110_cases[row.names(df_R110_cases) %ni% R110,]
+
+df_R110_y <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% R110)])
+df_R110_n_cases <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% row.names(df_R110_cases_only))])
+
+df_R110_y2 <- df_R110[,which(str_sub(colnames(df_R110), start= -5) %in% R110)]
+df_R110_n2 <- df_R110[,which(str_sub(colnames(df_R110), start= -5) %in% not_R110)]
+
+row_means_R110 <- rowMeans(df_R110_y)
+row_means_R110[row_means_R110 == 0] <- 300
+row_means_R110_n_cases <- rowMeans(df_R110_n_cases)
+row_means_R110_n_cases[row_means_R110_n_cases == 0] <- 300
+
+abundance_ratio_R110_cases <- row_means_R110/row_means_R110_n_cases
+df_proteom_selected$Ratio_R110_cases <- abundance_ratio_R110_cases
+df_proteom_selected$Log2FC_R110_cases <- log2(df_proteom_selected$Ratio_R110_cases) 
+
+df_t_tests_R110_cases <- df_t_tests
+
+df_R110_y_na_count <- apply(df_R110_y2, 1, function(x) sum(is.na(x)))
+
+df_proteom_selected_R110_cases <- df_proteom_selected
+
+df_proteom_selected_R110_cases <- df_proteom_selected_R110_cases[-which(df_R110_y_na_count >= 5),]
+
+
+df_t_tests_R110_cases <- df_t_tests_R110_cases[-which(df_R110_y_na_count >=5),]
+
+df_R110_cases <- df_R110_cases[-which(df_R110_y_na_count >= 5),]
+
+df_anova_R110_cases <- as.data.frame(t(df_t_tests_R110_cases))
+
+df_proteom_selected_R110_cases$`Gene Symbol`[duplicated(df_proteom_selected_R110_cases$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_cases$`Gene Symbol`[duplicated(df_proteom_selected_R110_cases$`Gene Symbol`)],"-dup")
+df_proteom_selected_R110_cases$`Gene Symbol`[duplicated(df_proteom_selected_R110_cases$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_cases$`Gene Symbol`[duplicated(df_proteom_selected_R110_cases$`Gene Symbol`)],"2")
+df_proteom_selected_R110_cases$`Gene Symbol`[duplicated(df_proteom_selected_R110_cases$`Gene Symbol`)] <- paste0(df_proteom_selected_R110_cases$`Gene Symbol`[duplicated(df_proteom_selected_R110_cases$`Gene Symbol`)],"3")
+colnames(df_anova_R110_cases) <- df_proteom_selected_R110_cases$`Gene Symbol`
+
+vector_names <- gsub(".*_","",rownames(df_anova_R110_cases))
+rownames(df_anova_R110_cases) <- vector_names
+df_anova_R110_cases <- df_anova_R110_cases[ order(row.names(df_anova_R110_cases)), ]
+df_anova_R110_cases  <- df_anova_R110_cases[row.names(df_anova_R110_cases ) %in% row.names(df_R110_cases),]
+df_anova_R110_cases <- df_anova_R110_cases[ order(row.names(df_anova_R110_cases)), ]
+
+Pat_char_anova_R110_cases <- Pat_char_anova[row.names(Pat_char_anova) %in% row.names(df_R110_cases),]
+Pat_char_anova_R110_cases <- Pat_char_anova_R110_cases[ order(row.names(Pat_char_anova_R110_cases)), ]
+
+result_anova_R110_cases <- data.frame("Protein" = colnames(df_anova_R110_cases), p_value = NA )
+for(i in 1:length(df_anova_R110_cases)){
+  if (all(row.names(Pat_char_anova_R110_cases) == row.names(df_anova_R110_cases)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova_R110_cases,df_anova_R110_cases[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~ R110 + Batch, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][1]
+  result_anova_R110_cases[i, 2] <- first_res
+}
+
+df_proteom_selected_R110_cases$pValues_R110 <- result_anova_R110_cases$p_value
+
+df_proteom_selected_R110_cases$p_adj <- p.adjust(df_proteom_selected_R110_cases$pValues_R110, method = "fdr", n = length(df_proteom_selected_R110_cases$pValues_R110))
+
+ggplot(df_proteom_selected_R110_cases, aes(x = Log2FC_R110_cases, y = -log10(p_adj),color = ifelse(p_adj<0.05& (Log2FC_R110_cases > 0.5 | Log2FC_R110_cases < - 0.5 ),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_R110_cases, p_adj < 0.05 & (Log2FC_R110_cases > 0.5 | Log2FC_R110_cases < - 0.5 )),
+                  aes(Log2FC_R110_cases, -log10(p_adj), label = `Gene Symbol`),size = 3, color="steelblue")
+
+df_proteom_FDRmaster_cases <- dplyr::select(df_proteom_FDRmaster_sel_ind, contains("Case"))
+df_proteom_FDRmaster_ctrls <- dplyr::select(df_proteom_FDRmaster_sel_ind, contains("Ctrl"))
+
+str_sub(colnames(df_proteom_FDRmaster_cases), start= -5)
+str_sub(colnames(df_proteom_FDRmaster_ctrls), start= -5)
+
+unmut_cases <- Pat_char_short$ID[Pat_char_short$IGHV_status == "unmutated" & Pat_char_short$det == 1]
+mut_cases <- Pat_char_short$ID[Pat_char_short$IGHV_status == "mutated" & Pat_char_short$det == 1]
+mut_controls <- Pat_char_short$ID[Pat_char_short$IGHV_status == "mutated" & Pat_char_short$det == 0]
+unmut_controls <- Pat_char_short$ID[Pat_char_short$IGHV_status == "unmutated" & Pat_char_short$det == 0]
+
+mut_total <- c(mut_cases,mut_controls)
+unmut_total <- c(unmut_cases,unmut_controls)
+
+t_anova <- t(df_anova)
+
+mutated_total <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% mut_total)])
+unmutated_total <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% unmut_total)])
+
+row_means_mutated <- rowMeans(mutated_total, na.rm = T)
+row_means_mutated[row_means_mutated == 0] <- 300
+row_means_unmut <- rowMeans(unmutated_total, na.rm = T)
+row_means_unmut[row_means_unmut == 0] <- 300
+abundance_ratio_IGHV <- row_means_unmut/row_means_mutated
+
+df_proteom_selected$Case_Control_Ratio_IGHV <- abundance_ratio_IGHV
+df_proteom_selected$Log2FC_UM <- log2(df_proteom_selected$Case_Control_Ratio_IGHV) 
+
+df_t_tests <- df_proteom_FDRmaster_sel_ind
+
+Pat_char_anova$IGHV_status[Pat_char_anova$IGHV_status == "NA"] <- NA
+
+for(i in 1:length(df_anova)){
+  if (all(row.names(Pat_char_anova) == row.names(df_anova)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova,df_anova[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~  Batch +IGHV_status, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][2]
+  result_anova[i, 3] <- first_res
+}
+
+df_proteom_selected$pValues_mut <- result_anova$p_value_mut
+
+#ratio is unmutated vs mutated
+df_proteom_selected$`Gene Symbol`[df_proteom_selected$Case_Control_Ratio_IGHV > 2]
+df_proteom_selected$`Gene Symbol`[df_proteom_selected$Case_Control_Ratio_IGHV < 0.5 ]
+df_proteom_selected$p_adj_UM <- p.adjust(df_proteom_selected$pValues_mut, method = "fdr", n = length(df_proteom_selected$pValues_mut))
+
+sign_markers_IGHV <- df_proteom_selected$`Gene Symbol`[df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM >= 0.5 |df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM <= -0.5]
+sign_FC_IGHV <- df_proteom_selected$Case_Control_Ratio_IGHV[df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM >= 0.5 |df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM <= -0.5]
+sign_p_adj_IGHV <- df_proteom_selected$p_adj_UM[df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM >= 0.5 |df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM <= -0.5]
+#write_xlsx(as.data.frame(cbind(sign_markers_IGHV,sign_FC_IGHV,sign_p_adj_IGHV)), "sign_hits_IGHV.xlsx") 
+
+
+ggplot(df_proteom_selected, aes(x = Log2FC_UM, y = -log10(p_adj_UM),color = ifelse(p_adj_UM<0.05& (Log2FC_UM > 0.5 | Log2FC_UM < - 0.5 ),"red","grey"))) +
+  geom_point(aes(alpha = ifelse(p_adj_UM<0.05& (Log2FC_UM > 0.5 | Log2FC_UM < - 0.5 ),1,0.01),size = ifelse(p_adj_UM<0.05& (Log2FC_UM > 0.5 | Log2FC_UM < - 0.5 ),0.51,0.5) ),show.legend = F) +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  geom_vline(
+    xintercept = c(0.5),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  geom_vline(
+    xintercept = c(-0.5),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  theme(axis.text=element_text(size=12))+
+  scale_size(range = c(1.75,2.5))+
+  scale_alpha(range = c(0.4,1))+
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected, p_adj_UM < 0.05& (Log2FC_UM > 0.5 | Log2FC_UM< - 0.5 )),
+                  aes(Log2FC_UM, -log10(p_adj_UM), label = `Gene Symbol`, fontface = "bold"),size = 4, color="steelblue")
+
+#ggsave("Volcano_IGHV.eps", device=cairo_ps )
+
+#39
+length(sign_markers)
+sign_markers <- df_proteom_selected$`Gene Symbol`[df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM >= 0.5 |df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM <= -0.5]
+#32
+length(sign_up)
+sign_up <- df_proteom_selected$`Gene Symbol`[df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM >= 0.5]
+length(sign_down)
+#7
+sign_down <- df_proteom_selected$`Gene Symbol`[df_proteom_selected$p_adj_UM <= 0.05 & df_proteom_selected$Log2FC_UM <= -0.5]
+
+df_tri12 <- df_proteom_FDRmaster_sel_ind
+
+tri12 <- Pat_char_short$ID[Pat_char_short$tri12_F == 1 ]
+not_tri12 <- Pat_char_short$ID[Pat_char_short$tri12_F == 0 ]
+
+df_tri12_y <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% tri12)])
+df_tri12_n <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% not_tri12)])
+
+df_tri12_y2 <- df_tri12[,which(str_sub(colnames(df_tri12), start= -5) %in% tri12)]
+df_tri12_n2 <- df_tri12[,which(str_sub(colnames(df_tri12), start= -5) %in% not_tri12)]
+
+row_means_tri12 <- rowMeans(df_tri12_y)
+row_means_tri12[row_means_tri12 == 0] <- 300
+row_means_tri12_n <- rowMeans(df_tri12_n)
+row_means_tri12_n [row_means_tri12_n  == 0] <- 300
+
+abundance_ratio_tri12 <- row_means_tri12/row_means_tri12_n
+abundance_ratio_tri12_rev <- row_means_tri12_n/row_means_tri12
+df_proteom_selected$Ratio_tri12 <- abundance_ratio_tri12
+df_proteom_selected$ratio_tri12_rev <- abundance_ratio_tri12_rev 
+df_proteom_selected$Log2FC_tri12 <- log2(df_proteom_selected$Ratio_tri12) 
+
+
+df_t_tests_tri_12 <- df_t_tests
+
+df_tri12_y_na_count <- apply(df_tri12_y2, 1, function(x) sum(is.na(x)))
+
+df_proteom_selected_tri12 <- df_proteom_selected
+
+df_proteom_selected_tri12 <- df_proteom_selected_tri12[-which(df_tri12_y_na_count >= 7),]
+
+which(df_proteom_selected_tri12$`Gene Symbol` == "DCLK2")
+
+df_t_tests_tri_12 <- df_t_tests_tri_12[-which(df_tri12_y_na_count >= 7),]
+
+df_tri12 <- df_tri12[-which(df_tri12_y_na_count >= 7),]
+
+df_anova_tri12 <- as.data.frame(t(df_t_tests_tri_12))
+df_proteom_selected_tri12$`Gene Symbol`[duplicated(df_proteom_selected_tri12$`Gene Symbol`)] <- paste0(df_proteom_selected_tri12$`Gene Symbol`[duplicated(df_proteom_selected_tri12$`Gene Symbol`)],"-dup")
+df_proteom_selected_tri12$`Gene Symbol`[duplicated(df_proteom_selected_tri12$`Gene Symbol`)] <- paste0(df_proteom_selected_tri12$`Gene Symbol`[duplicated(df_proteom_selected_tri12$`Gene Symbol`)],"2")
+df_proteom_selected_tri12$`Gene Symbol`[duplicated(df_proteom_selected_tri12$`Gene Symbol`)] <- paste0(df_proteom_selected_tri12$`Gene Symbol`[duplicated(df_proteom_selected_tri12$`Gene Symbol`)],"3")
+colnames(df_anova_tri12) <- df_proteom_selected_tri12$`Gene Symbol`
+
+test <- df_proteom_selected_tri12[df_proteom_selected_tri12$`Gene Symbol`== "DCLK2",]
+
+vector_names <- gsub(".*_","",rownames(df_anova_tri12))
+rownames(df_anova_tri12) <- vector_names
+df_anova_tri12 <- df_anova_tri12[ order(row.names(df_anova_tri12)), ]
+
+result_anova_tri12 <- data.frame("Protein" = colnames(df_anova_tri12), P_values = NA )
+
+for(i in 1:length(df_anova_tri12)){
+  if (all(row.names(Pat_char_anova) == row.names(df_anova_tri12)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova,df_anova_tri12[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~  Batch + tri12_F, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][2]
+  result_anova_tri12[i, 2] <- first_res
+}
+
+df_proteom_selected_tri12$P_tri12 <- result_anova_tri12$P_values
+
+df_proteom_selected_tri12$p_adj_tri12 <- p.adjust(df_proteom_selected_tri12$P_tri12, method = "fdr", n = length(df_proteom_selected_tri12$P_tri12))
+
+sign_markers_tri12 <- df_proteom_selected_tri12$`Gene Symbol`[df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 >= 0.5 |df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 <= -0.5]
+sign_FC_tri12 <- df_proteom_selected_tri12$Ratio_tri12[df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 >= 0.5 |df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 <= -0.5]
+sign_p_adj_tri12 <- df_proteom_selected_tri12$p_adj_tri12[df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 >= 0.5 |df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 <= -0.5]
+#write_xlsx(as.data.frame(cbind(sign_markers_tri12,sign_FC_tri12,sign_p_adj_tri12)), "sign_hits_tri12.xlsx") 
+
+ggplot(df_proteom_selected_tri12, aes(x = Log2FC_tri12, y = -log10(p_adj_tri12),color = ifelse(p_adj_tri12<0.05& (Log2FC_tri12 > 0.5 | Log2FC_tri12 < - 0.5 ),"red","grey"))) +
+  geom_point(aes(alpha = ifelse(p_adj_tri12<0.05& (Log2FC_tri12 > 0.5 | Log2FC_tri12 < - 0.5 ),1,0.01),size = ifelse(p_adj_tri12<0.05& (Log2FC_tri12 > 0.5 | Log2FC_tri12 < - 0.5 ),0.51,0.5) ),show.legend = F) +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  geom_vline(
+    xintercept = c(0.5),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  geom_vline(
+    xintercept = c(-0.5),
+    col = "black",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  theme(axis.text=element_text(size=12))+
+  scale_size(range = c(1.75,2.5))+
+  scale_alpha(range = c(0.4,1))+
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_tri12, p_adj_tri12 < 0.05& (Log2FC_tri12 > 0.5 | Log2FC_tri12< - 0.5 )),
+                  aes(Log2FC_tri12, -log10(p_adj_tri12), label = `Gene Symbol`, fontface = "bold"),size = 4, color="steelblue")
+
+#ggsave("Volcano_tri12.eps", device=cairo_ps )
+
+length(sign_markers)
+#37
+sign_markers <- df_proteom_selected_tri12$`Gene Symbol`[df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 >= 0.5 |df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 <= -0.5]
+
+length(sign_up)
+#8
+sign_up <- df_proteom_selected_tri12$`Gene Symbol`[df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 >= 0.5]
+length(sign_down)
+#29
+sign_down <- df_proteom_selected_tri12$`Gene Symbol`[df_proteom_selected_tri12$p_adj_tri12 <= 0.05 & df_proteom_selected_tri12$Log2FC_tri12 <= -0.5]
+
+df_TP53 <- df_proteom_FDRmaster_sel_ind
+df_proteom_selected_TP53 <- df_proteom_selected
+TP53 <- Pat_char_short$ID[Pat_char_short$TP53 == "mut" |Pat_char_short$del17p_F == 1 ]
+Not_TP53 <- Pat_char_short$ID[Pat_char_short$TP53 == "wt" & Pat_char_short$del17p_F == 0  ]
+
+df_TP53_y <- as.data.frame(t_anova[,which(str_sub(colnames(t_anova), start= -5) %in% TP53)])
+df_TP53_n <- as.data.frame(t_anova[,which(str_sub(colnames(t_anova), start= -5) %in% Not_TP53)])
+
+df_t_tests_TP53 <- df_t_tests
+
+df_TP53_y_na_count <- apply(df_TP53_y, 1, function(x) sum(is.na(x)))
+
+row_means_TP53_y <- rowMeans(df_TP53_y,na.rm = T)
+row_means_TP53_y[row_means_TP53_y == 0] <- 300
+row_means_TP53_n <- rowMeans(df_TP53_n, na.rm = T)
+row_means_TP53_n  [row_means_TP53_n   == 0] <- 300
+abundance_ratio_TP53 <- row_means_TP53_y /row_means_TP53_n 
+df_proteom_selected_TP53$Ratio_TP53  <- abundance_ratio_TP53 
+df_proteom_selected_TP53$Log2FC_TP53  <- log2(df_proteom_selected_TP53$Ratio_TP53) 
+
+df_anova_TP53 <- as.data.frame(t(df_t_tests_TP53))
+df_proteom_selected_TP53$`Gene Symbol`[duplicated(df_proteom_selected_TP53$`Gene Symbol`)] <- paste0(df_proteom_selected_TP53$`Gene Symbol`[duplicated(df_proteom_selected_TP53$`Gene Symbol`)],"-dup")
+df_proteom_selected_TP53$`Gene Symbol`[duplicated(df_proteom_selected_TP53$`Gene Symbol`)] <- paste0(df_proteom_selected_TP53$`Gene Symbol`[duplicated(df_proteom_selected_TP53$`Gene Symbol`)],"2")
+df_proteom_selected_TP53$`Gene Symbol`[duplicated(df_proteom_selected_TP53$`Gene Symbol`)] <- paste0(df_proteom_selected_TP53$`Gene Symbol`[duplicated(df_proteom_selected_TP53$`Gene Symbol`)],"3")
+colnames(df_anova_TP53) <- df_proteom_selected_TP53$`Gene Symbol`
+
+
+vector_names <- gsub(".*_","",rownames(df_anova_TP53))
+rownames(df_anova_TP53) <- vector_names
+df_anova_TP53 <- df_anova_TP53[ order(row.names(df_anova_TP53)), ]
+
+result_anova_TP53 <- data.frame("Protein" = colnames(df_anova_TP53), P_values = NA )
+
+for(i in 1:length(df_anova_TP53)){
+  if (all(row.names(Pat_char_anova) == row.names(df_anova_TP53)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  anova_i <- cbind(Pat_char_anova,df_anova_TP53[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~  Batch + TP53_17p, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][2]
+  result_anova_TP53[i, 2] <- first_res
+}
+
+df_proteom_selected_TP53$P_TP53 <- result_anova_TP53$P_values
+
+
+df_proteom_selected_TP53$p_adj_TP53 <- p.adjust(df_proteom_selected_TP53$P_TP53, method = "fdr", n = length(df_proteom_selected_TP53$P_TP53))
+
+min(df_proteom_selected_TP53$P_TP53)
+min(df_proteom_selected_TP53$p_adj_TP53)
+df_proteom_selected_TP53$`Gene Symbol`[order(df_proteom_selected_TP53$p_adj_TP53)]
+df_proteom_selected_TP53$p_adj_TP53[order(df_proteom_selected_TP53$p_adj_TP53)]
+
+sign_markers_TP53 <- df_proteom_selected_TP53$`Gene Symbol`[df_proteom_selected_TP53$p_adj_TP53 <= 0.05 & df_proteom_selected_TP53$Log2FC_TP53 >= 0.5 |df_proteom_selected_TP53$p_adj_TP53 <= 0.05 & df_proteom_selected_TP53$Log2FC_TP53 <= -0.5]
+sign_FC_TP53 <- df_proteom_selected_TP53$Ratio_TP53[df_proteom_selected_TP53$p_adj_TP53 <= 0.05 & df_proteom_selected_TP53$Log2FC_TP53 >= 0.5 |df_proteom_selected_TP53$p_adj_TP53 <= 0.05 & df_proteom_selected_TP53$Log2FC_TP53 <= -0.5]
+sign_p_adj_TP53 <- df_proteom_selected_TP53$p_adj_TP53[df_proteom_selected_TP53$p_adj_TP53 <= 0.05 & df_proteom_selected_TP53$Log2FC_TP53 >= 0.5 |df_proteom_selected_TP53$p_adj_TP53 <= 0.05 & df_proteom_selected_TP53$Log2FC_TP53 <= -0.5]
+#write_xlsx(as.data.frame(cbind(sign_markers_TP53,sign_FC_TP53,sign_p_adj_TP53)), "sign_hits_TP53.xlsx") 
+
+ggplot(df_proteom_selected_TP53, aes(x = Log2FC_TP53, y = -log10(p_adj_TP53),color = ifelse(p_adj_TP53<0.05 & (Log2FC_TP53 > 0.5 | Log2FC_TP53 < -0.5),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_TP53, p_adj_TP53 < 0.05& (Log2FC_TP53 > 0.5 | Log2FC_TP53 < -0.5)),
+                  aes(Log2FC_TP53, -log10(p_adj_TP53), label = `Gene Symbol`),size = 3, color="steelblue")
+
+#13q
+
+df_13q <- df_proteom_FDRmaster_sel_ind
+df_proteom_selected_13q <- df_proteom_selected
+
+ID_13q <- Pat_char_short$ID[Pat_char_short$`13q_F`== 1 ]
+Not_13q <- Pat_char_short$ID[Pat_char_short$`13q_F` == 0  ]
+
+df_13q_y <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% ID_13q)])
+df_13q_n <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% Not_13q)])
+
+df_t_tests_13q <- df_t_tests
+
+
+row_means_13q_y <- rowMeans(df_13q_y,na.rm = T)
+row_means_13q_y[row_means_13q_y == 0] <- 300
+row_means_13q_n <- rowMeans(df_13q_n, na.rm = T)
+row_means_13q_n  [row_means_13q_n   == 0] <- 300
+abundance_ratio_13q <- row_means_13q_y /row_means_13q_n 
+df_proteom_selected_13q$Ratio_13q  <- abundance_ratio_13q 
+df_proteom_selected_13q$Log2FC_13q  <- log2(df_proteom_selected_13q$Ratio_13q) 
+
+df_anova_13q <- as.data.frame(t(df_t_tests_13q))
+df_proteom_selected_13q$`Gene Symbol`[duplicated(df_proteom_selected_13q$`Gene Symbol`)] <- paste0(df_proteom_selected_13q$`Gene Symbol`[duplicated(df_proteom_selected_13q$`Gene Symbol`)],"-dup")
+df_proteom_selected_13q$`Gene Symbol`[duplicated(df_proteom_selected_13q$`Gene Symbol`)] <- paste0(df_proteom_selected_13q$`Gene Symbol`[duplicated(df_proteom_selected_13q$`Gene Symbol`)],"2")
+df_proteom_selected_13q$`Gene Symbol`[duplicated(df_proteom_selected_13q$`Gene Symbol`)] <- paste0(df_proteom_selected_13q$`Gene Symbol`[duplicated(df_proteom_selected_13q$`Gene Symbol`)],"3")
+colnames(df_anova_13q) <- df_proteom_selected_13q$`Gene Symbol`
+
+vector_names <- gsub(".*_","",rownames(df_anova_13q))
+rownames(df_anova_13q) <- vector_names
+df_anova_13q <- df_anova_13q[ order(row.names(df_anova_13q)), ]
+
+result_anova_13q <- data.frame("Protein" = colnames(df_anova_13q), P_values = NA )
+
+for(i in 1:length(df_anova_13q)){
+  anova_i <- cbind(Pat_char_anova,df_anova_13q[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~  Batch + `13q_F`, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][2]
+  result_anova_13q[i, 2] <- first_res
+}
+
+df_proteom_selected_13q$P_13q <- result_anova_13q$P_values
+
+
+
+df_proteom_selected_13q$p_adj_13q <- p.adjust(df_proteom_selected_13q$P_13q, method = "fdr", n = length(df_proteom_selected_13q$P_13q))
+
+#adjust color based on FC as well
+ggplot(df_proteom_selected_13q, aes(x = Log2FC_13q, y = -log10(p_adj_13q),color = ifelse(p_adj_13q<0.01 & (Log2FC_13q > 0.5 | Log2FC_13q < - 0.5 ),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.01)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_13q, p_adj_13q < 0.01 & (Log2FC_13q > 0.5 |Log2FC_13q < -0.5 )),
+                  aes(Log2FC_13q, -log10(p_adj_13q), label = `Gene Symbol`),size = 3, color="steelblue")
+
+
+min(df_proteom_selected_13q$P_13q)
+min(df_proteom_selected_13q$p_adj_13q)
+df_proteom_selected_13q$`Gene Symbol`[order(df_proteom_selected_13q$p_adj_13q)]
+df_proteom_selected_13q$p_adj_13q[order(df_proteom_selected_13q$p_adj_13q)]
+df_proteom_selected_13q$p_adj_13q[df_proteom_selected_13q$`Gene Symbol` == "ISG20"]
+df_proteom_selected_13q$Ratio_13q[df_proteom_selected_13q$`Gene Symbol` == "ISG20"]
+#11q
+
+
+df_11q <- df_proteom_FDRmaster_sel_ind
+df_proteom_selected_11q <- df_proteom_selected
+
+df_11q<-dplyr::select(df_11q, !matches("009CO"))
+df_proteom_selected_11q <- select(df_proteom_selected_11q, !matches("009CO"))
+
+Pat_char_short$ID[Pat_char_short$`del11q_F`== "NA" ]
+
+ID_11q <- Pat_char_short$ID[Pat_char_short$`del11q_F`== 1 ]
+Not_11q <- Pat_char_short$ID[Pat_char_short$`del11q_F` == 0  ]
+
+df_11q_y <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% ID_11q)])
+df_11q_n <- as.data.frame(combat_edata[,which(str_sub(colnames(combat_edata), start= -5) %in% Not_11q)])
+
+df_t_tests_11q <- df_t_tests
+
+
+row_means_11q_y <- rowMeans(df_11q_y,na.rm = T)
+row_means_11q_y[row_means_11q_y == 0] <- 300
+row_means_11q_n <- rowMeans(df_11q_n, na.rm = T)
+
+row_means_11q_n  [row_means_11q_n   == 0] <- 300
+abundance_ratio_11q <- row_means_11q_y /row_means_11q_n 
+df_proteom_selected_11q$Ratio_11q  <- abundance_ratio_11q 
+df_proteom_selected_11q$Log2FC_11q  <- log2(df_proteom_selected_11q$Ratio_11q) 
+
+df_anova_11q <- as.data.frame(t(df_t_tests_11q))
+df_proteom_selected_11q$`Gene Symbol`[duplicated(df_proteom_selected_11q$`Gene Symbol`)] <- paste0(df_proteom_selected_11q$`Gene Symbol`[duplicated(df_proteom_selected_11q$`Gene Symbol`)],"-dup")
+df_proteom_selected_11q$`Gene Symbol`[duplicated(df_proteom_selected_11q$`Gene Symbol`)] <- paste0(df_proteom_selected_11q$`Gene Symbol`[duplicated(df_proteom_selected_11q$`Gene Symbol`)],"2")
+df_proteom_selected_11q$`Gene Symbol`[duplicated(df_proteom_selected_11q$`Gene Symbol`)] <- paste0(df_proteom_selected_11q$`Gene Symbol`[duplicated(df_proteom_selected_11q$`Gene Symbol`)],"3")
+colnames(df_anova_11q) <- df_proteom_selected_11q$`Gene Symbol`
+
+vector_names <- gsub(".*_","",rownames(df_anova_13q))
+rownames(df_anova_11q) <- vector_names
+df_anova_11q <- df_anova_11q[ order(row.names(df_anova_11q)), ]
+
+result_anova_11q <- data.frame("Protein" = colnames(df_anova_11q), P_values = NA )
+
+for(i in 1:length(df_anova_11q)){
+  anova_i <- cbind(Pat_char_anova,df_anova_11q[,i])
+  colnames(anova_i)[31] <- "protein"
+  two.way <- aov(protein ~  Batch + `del11q_F`, data = anova_i)
+  sum2 <- summary(two.way)
+  first_res <- sum2[[1]][["Pr(>F)"]][2]
+  result_anova_11q[i, 2] <- first_res
+}
+
+df_proteom_selected_11q$P_11q <- result_anova_11q$P_values
+
+
+df_proteom_selected_11q$p_adj_11q <- p.adjust(df_proteom_selected_11q$P_11q, method = "fdr", n = length(df_proteom_selected_11q$P_11q))
+
+
+ggplot(df_proteom_selected_11q, aes(x = Log2FC_11q, y = -log10(p_adj_11q),color = ifelse(p_adj_11q<0.05 & (Log2FC_11q > 0.5 | Log2FC_11q < - 0.5 ),"red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("not significant", "significant"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_11q, p_adj_11q < 0.05 & (Log2FC_11q > 0.5 | Log2FC_11q < - 0.5 )),
+                  aes(Log2FC_11q, -log10(p_adj_11q), label = `Gene Symbol`),size = 3, color="steelblue")
+
+min(df_proteom_selected_11q$P_11q)
+min(df_proteom_selected_11q$p_adj_11q)
+df_proteom_selected_11q$`Gene Symbol`[order(df_proteom_selected_11q$p_adj_11q)][1:30]
+df_proteom_selected_11q$p_adj_11q[order(df_proteom_selected_11q$p_adj_11q)][1:30]
+
+
+temp_df <- df_proteom_selected
+temp_df <- temp_df[complete.cases(temp_df$`Gene Symbol`),]
+temp_df_samples <- dplyr::select(temp_df,contains("corrected"))
+temp_df_samples  <- dplyr::select(temp_df_samples , -paste0("corrected_",ID_long_full))
+transpose_temp_df <- as.data.frame(t(temp_df_samples))
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"-dup")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"2")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"3")
+
+colnames(transpose_temp_df) <- temp_df$`Gene Symbol`
+data_imputed <- impute.QRILC(transpose_temp_df)[[1]]
+
+vector_names <- gsub(".*_","",rownames(data_imputed))
+rownames(data_imputed) <- vector_names
+
+for(i in 1:length(data_imputed)){
+  minimal_value_protein <- min(transpose_temp_df[,i],na.rm =T)
+  neg_index <- which(data_imputed[,i] <0)
+  data_imputed[neg_index,i] <- minimal_value_protein 
+}
+
+pcOut <- prcomp(combat_data, center =TRUE, scale. = TRUE)
+
+pcRes <- pcOut$x
+eigs <- pcOut$sdev^2
+varExp <- structure(eigs/sum(eigs),names = colnames(pcRes))
+
+rownames(Pat_char_short) <- Pat_char_short$ID
+
+colAnno <- as.data.frame(Pat_char_short)
+unknown_ighv <- colAnno$ID[colAnno$IGHV_status == "NA"]
+colAnno <- colAnno[colAnno$IGHV_status != "NA",]
+'%ni%' <- Negate('%in%')
+colAnno  <- colAnno[ order(row.names(colAnno)), ]
+pcRes <- pcRes[ order(row.names(pcRes)), ]
+pcRes <- pcRes[rownames(pcRes) %ni% unknown_ighv,]
+
+corTab <- lapply(colnames(pcRes),  function(pc) {
+  ighvCor <- t.test(pcRes[,pc] ~ colAnno$IGHV_status, var.equal=TRUE)
+  tri12Cor <- t.test(pcRes[,pc] ~ colAnno$tri12_F, var.equal=TRUE)
+  tibble(PC = pc, 
+         feature=c("IGHV", "trisomy12"),
+         p = c(ighvCor$p.value, tri12Cor$p.value))
+}) %>% bind_rows() %>% mutate(p.adj = p.adjust(p)) %>%
+  filter(p <= 0.05) %>% arrange(p)
+corTab
+
+#Second PCA
+temp_df <- df_proteom_selected
+temp_df <- temp_df[complete.cases(temp_df$`Gene Symbol`),]
+temp_df_samples <- dplyr::select(temp_df,contains("corrected"))
+temp_df_samples  <- dplyr::select(temp_df_samples , -paste0("corrected_",ID_long_full))
+transpose_temp_df <- as.data.frame(t(temp_df_samples))
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"-dup")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"2")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"3")
+colnames(transpose_temp_df) <- temp_df$`Gene Symbol`
+data_imputed <- impute.QRILC(transpose_temp_df)[[1]]
+
+for(i in 1:length(data_imputed)){
+  minimal_value_protein <- min(transpose_temp_df[,i],na.rm =T)
+  #get negative values from current column
+  neg_index <- which(data_imputed[,i] <0)
+  #replace with lowest positive value
+  data_imputed[neg_index,i] <- minimal_value_protein 
+}
+variables_imputed <- impute.QRILC(transpose_temp_df)[[2]]
+
+
+
+vector_names <- gsub(".*_","",rownames(data_imputed))
+rownames(data_imputed) <- vector_names
+data_imputed <- data_imputed[sort(row.names(data_imputed)),]
+
+
+pcOut <- prcomp(combat_data, center =TRUE, scale. = TRUE)
+
+pcRes <- pcOut$x
+eigs <- pcOut$sdev^2
+varExp <- structure(eigs/sum(eigs),names = colnames(pcRes))
+
+rownames(Pat_char_short) <- Pat_char_short$ID
+
+colAnno <- as.data.frame(Pat_char_short)
+colAnno <- colAnno[sort(row.names(colAnno)),]
+plotTab <- pcRes %>% data.frame() %>% cbind(colAnno) %>% as_tibble()
+
+plotTab$IGHV_status[plotTab$IGHV_status == "NA"] <- "Unknown"
+plotTab$IGHV_status <- as.factor(plotTab$IGHV_status)
+plotTab$tri12_F <- as.factor(plotTab$tri12_F)
+str(plotTab)
+
+plotTab$tri12_F
+plotTab$IGHV_status
+plotTab$del11q_F <- NULL
+summary(pcOut)
+
+plotPCA12 <- ggplot(plotTab, aes(x=PC1, y=PC2, col = tri12_F, shape = IGHV_status)) + geom_point(size=4) +
+  xlab(sprintf("PC1 (%1.2f%%)",varExp[["PC1"]]*100)) +
+  ylab(sprintf("PC2 (%1.2f%%)",varExp[["PC2"]]*100)) +
+  scale_color_manual(values = c("blue","red")) +
+  scale_shape_manual(values = c("mutated" = 16,"unmutated" =1)) +
+  geom_hline(yintercept = 0, linetype ="dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype ="dashed", color = "grey50") +
+  theme_bw() + theme(legend.position = "bottom", legend.text = element_text(size =15), legend.title = element_text(size=15))
+
+plotPCA12
+#
+md_pattern(transpose_temp_df[,is.na(transpose_temp_df)])
+
+
+apply(df, 2, function(x) any(is.na(x))) 
+indx <- apply(transpose_temp_df, 2, function(x) any(is.na(x)))
+cols_missing <- transpose_temp_df[,indx]
+barplot(table(df_proteom_FDRmaster_individual$na_count), col='#18bc9c' )
+
+Pat_char_short$ID <- as.factor(Pat_char_short$ID)
+Pat_char_short$IGHV_status <- as.factor(Pat_char_short$IGHV_status)
+Pat_char_short$TP53 <- as.factor(Pat_char_short$TP53)
+Pat_char_short$tri12_F <- as.factor(Pat_char_short$tri12_F)
+Pat_char_short$del17p_F<- as.factor(Pat_char_short$del17p_F)
+Pat_char_short$det <- as.factor(Pat_char_short$det)
+Pat_char_short$Sex <- as.factor(Pat_char_short$Sex)
+
+str(Pat_char_short)
+Pat_char_short$IGHV_status <- na_if(Pat_char_short$IGHV_status,"NA")
+plot_all(as.data.frame(Pat_char_short[2:7]),allNA = TRUE, fill = '#18bc9c', border = '#2C3E50',
+         ncol = 3, nclass = 30)
+
+temp_df <- df_proteom_selected
+temp_df <- temp_df[complete.cases(temp_df$`Gene Symbol`),]
+temp_df_samples <- dplyr::select(temp_df,contains("corrected"))
+temp_df_samples  <- dplyr::select(temp_df_samples , -paste0("corrected_",ID_long_full))
+transpose_temp_df <- as.data.frame(t(temp_df_samples))
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"-dup")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"2")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"3")
+colnames(transpose_temp_df) <- temp_df$`Gene Symbol`
+
+data_imputed <- impute.QRILC(transpose_temp_df)[[1]]
+
+corrected_abundances <- temp_df_samples
+colnames(corrected_abundances) <- gsub(".*_","",colnames(corrected_abundances))
+combat_abundances <- as.data.frame(combat_edata)
+corrected_abundances <- corrected_abundances[,order(names(corrected_abundances))]
+combat_abundances <- combat_abundances[,order(names(corrected_abundances))]
+all(colnames(combat_abundances) == colnames(corrected_abundances))
+
+
+test_na <- apply(corrected_abundances,2,is.na)
+
+summarize_na <- function(x) {
+  temp_x <- round(100 * sum(x) / length(x))
+  return(temp_x)
+}
+
+test_na_percent <- apply(test_na,2,summarize_na)
+
+original_samples <- dplyr::select(df_proteom_selected,contains("Abundances (Normalized)"))
+original_samples <- dplyr::select(original_samples,matches(", Case,|, Ctrl,"))
+
+corrected_abundances1 <- original_samples
+test1_na <- apply(corrected_abundances1,2,is.na)
+
+
+summarize_na <- function(x) {
+  temp_x <- round(100 * sum(x) / length(x))
+  return(temp_x)
+}
+
+test1_na_percent <- apply(test1_na,2,summarize_na)
+str_sub(names(test1_na_percent), start= -5)
+overview_before <- data.frame(test1_na_percent, names = str_sub(names(test1_na_percent), start= -5))
+overview_after <- data.frame(test_na_percent, names = gsub(".*_","",names(test_na_percent)))
+
+
+overview <- merge(overview_before,overview_after)
+overview <- overview[order(overview$names),]
+colnames(overview) <- c("ID","NA % before correction","NA % after correction")
+overview$'increase in NA by correction' <- overview$`NA % after correction`-overview$`NA % before correction`
+#write_xlsx(overview,"Missing_values.xlsx" )
+
+sd_corr <- apply(combat_abundances,1,sd, na.rm = T)
+mean_corr <- apply(combat_abundances,1,mean, na.rm = T)
+df_sd <- data.frame("mean" = mean_corr, "sd" = sd_corr)
+df_sd$sd_plus_2 <- df_sd$mean + 2*df_sd$sd
+df_sd$sd_min_2 <- df_sd$mean - 2*df_sd$sd
+
+
+#For each row, check if each value is greater than sd_plus_2 or smaller than sd_min_2
+corrected_abundances_sd <- combat_abundances
+for(i in 1:nrow(combat_abundances)){
+ greater_i<-  combat_abundances[i,] >  df_sd$sd_plus_2[i]
+ corrected_abundances_sd[i,] <- greater_i
+}
+
+corrected_abundances_sd_min <- combat_abundances
+for(i in 1:nrow(combat_abundances)){
+  smaller_i <-  combat_abundances[i,] <  df_sd$sd_min_2[i]
+  corrected_abundances_sd_min[i,] <- smaller_i
+}
+
+#count the number of 1's in each column
+summarize_sd <- function(x) {
+  temp_x <- round(100 * sum(x, na.rm = T) / length(x))
+  return(temp_x)
+}
+larger_sd_percent <- apply(corrected_abundances_sd,2,summarize_sd )
+smaller_sd_percent <- apply(corrected_abundances_sd_min,2,summarize_sd )
+
+overview_sd <- data.frame(larger_sd_percent, smaller_sd_percent, test_na_percent, names = gsub(".*_","",names(larger_sd_percent)))
+overview_sd$total <- overview_sd$larger_sd_percent + overview_sd$smaller_sd_percent
+
+for(i in 1:length(data_imputed)){
+  minimal_value_protein <- min(transpose_temp_df[,i],na.rm =T)
+
+  neg_index <- which(data_imputed[,i] <0)
+  data_imputed[neg_index,i] <- minimal_value_protein 
+}
+
+
+data_imputed_t <- t(data_imputed)
+
+vector_names <- gsub(".*_","",colnames(data_imputed_t))
+colnames(data_imputed_t) <- vector_names
+data_imputed_t <- data_imputed_t[ , order(colnames(data_imputed_t))]
+
+
+colAnno <- as.data.frame(Pat_char_short)
+colAnno <- colAnno[order(colAnno$ID),]
+rownames(colAnno) <- colAnno$ID
+
+colAnno$TP53_sum[colAnno$TP53 == "mut" |colAnno$del17p_F == 1 ] <- "TP53_mut"
+colAnno$TP53_sum[colAnno$TP53 == "wt" & colAnno$del17p_F == 0 ] <- "TP53_wt"
+
+colAnno2 <-  colAnno[,c("IGHV_status","tri12_F","del11q_F","13q_F","TP53_sum","det","Batch","R110")]
+
+colAnno2$IGHV_status <- as.character(colAnno2$IGHV_status)
+colAnno2$IGHV_status <- na_if(colAnno2$IGHV_status,"NA")
+colAnno2$IGHV_status[is.na(colAnno2$IGHV_status)] <- "Unknown"
+
+colAnno2$tri12_F <- as.character(colAnno2$tri12_F)
+colAnno2$tri12_F <- ifelse(colAnno2$tri12_F %in% "1", "yes","no")
+
+colAnno2$det <- as.character(colAnno2$det)
+colAnno2$det <- ifelse(colAnno2$det %in% "1", "Progression","Indolent")
+colAnno2$del11q_F <- as.character(colAnno2$del11q_F)
+colAnno2$del11q_F <- ifelse(colAnno2$del11q_F %in% "1", "yes","no")
+colAnno2$`13q_F` <- as.character(colAnno2$`13q_F`)
+colAnno2$`13q_F` <- ifelse(colAnno2$`13q_F` %in% "1", "yes","no")
+
+
+colnames(colAnno2) <- c("IGHV_status","tri12","del11q","del13q","TP53","Outcome","Batch","R110")
+
+
+colAnno2$Batch <- as.character(colAnno2$Batch)
+
+colAnno3 <- colAnno2
+colAnno3$Batch <- NULL
+colAnno3 <- colAnno3[, c("R110","tri12","TP53","del11q","del13q","IGHV_status","Outcome")]
+
+colnames(colAnno3) <- c("IGLV3-21 R110","+12","TP53 aberrancies","del11q22","del13q14","IGHV mutational status","Clinical outcome")
+
+
+annoCol <- list(Outcome = c(Progression = "red3",Indolent = "royalblue2"),tri12 = c(yes = "black",no = "grey80"),
+                IGHV_status = c(mutated = "orange", unmutated = "darkgreen"),
+                del11q = c(yes = "black",no = "grey80"),
+                del13q = c(yes = "black",no = "grey80"),
+                TP53 = c(TP53_mut = "black",TP53_wt = "grey80"))
+
+annoCol3 <- list(`Clinical outcome` = c(Progression = "red3",Indolent = "royalblue2"),`+12` = c(yes = "black",no = "grey80"),
+                 `IGHV mutational status` = c(mutated = "orange", unmutated = "darkgreen"),
+                del11q22 = c(yes = "black",no = "grey80"),
+                del13q14 = c(yes = "black",no = "grey80"),
+                `TP53 aberrancies` = c(TP53_mut = "black",TP53_wt = "grey80"),`IGLV3-21 R110` = c(R110 = "black",No = "grey80"))
+
+var_genes <- apply(combat_edata, 1, var)
+head(var_genes)
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:500]
+head(select_var)
+
+highly_variable_lcpm <- combat_edata[select_var,]
+dim(highly_variable_lcpm)
+head(highly_variable_lcpm)
+
+
+
+pheatmap(data_imputed_t, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = FALSE, show_colnames = F,
+         treeheight_row = 0)
+
+
+pheatmap(combat_edata, annotation_col = colAnno2, scale = "row",
+                   clustering_method = "average", clustering_distance_cols = "correlation",
+                   color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+                   show_rownames = FALSE, show_colnames = F,
+                   treeheight_row = 0)
+
+pheatmap(highly_variable_lcpm, annotation_col = colAnno3, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol3,
+         show_rownames = FALSE, show_colnames = F,
+         treeheight_row = 0)
+
+
+
+CaCo_proteins <- df_proteom_selected$`Gene Symbol`[df_proteom_selected$p_adj < 0.05 &(df_proteom_selected$Log2FC_Co_Ca > 0.5 | df_proteom_selected$Log2FC_Co_Ca < -0.5)]
+
+CaCo_imputed <- combat_edata[rownames(combat_edata) %in% CaCo_proteins,]
+
+pheatmap(CaCo_imputed, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+
+tri12_proteins <- df_proteom_selected_tri12$`Gene Symbol`[df_proteom_selected_tri12$p_adj_tri12 < 0.05 & (df_proteom_selected_tri12$Log2FC_tri12 > 0.5 |df_proteom_selected_tri12$Log2FC_tri12 < -0.5)]
+
+tri12_imputed <- combat_edata[rownames(combat_edata) %in% tri12_proteins,]
+
+pheatmap(tri12_imputed, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+IGHV_proteins <- df_proteom_selected$`Gene Symbol`[df_proteom_selected$p_adj_UM < 0.05 & (df_proteom_selected$Log2FC_UM > 0.5 |df_proteom_selected$Log2FC_UM < -0.5)]
+
+IGHV_imputed <- combat_edata[rownames(combat_edata) %in% IGHV_proteins,]
+
+pheatmap(IGHV_imputed, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+TP53_proteins <- df_proteom_selected_TP53$`Gene Symbol`[df_proteom_selected_TP53$p_adj_TP53 < 0.05& (df_proteom_selected_TP53$Log2FC_TP53 > 0.5 |df_proteom_selected_TP53$Log2FC_TP53 < -0.5)]
+
+TP53_imputed <- combat_edata[rownames(combat_edata) %in% TP53_proteins,]
+
+pheatmap(TP53_imputed, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+R110_proteins <- df_proteom_selected_R110$`Gene Symbol`[df_proteom_selected_R110$p_adj < 0.05& (df_proteom_selected_R110$Log2FC_R110 > 0.5 |df_proteom_selected_R110$Log2FC_R110 < -0.5)]
+
+R110_imputed <- combat_edata[rownames(combat_edata) %in% R110_proteins,]
+
+pheatmap(R110_imputed, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+R110_proteins_mut <- df_proteom_selected_R110_mut$`Gene Symbol`[df_proteom_selected_R110_mut$p_adj < 0.05& (df_proteom_selected_R110_mut$Log2FC_R110_mut > 0.5 |df_proteom_selected_R110_mut$Log2FC_R110_mut < -0.5)]
+
+R110_imputed_mut <- combat_edata[rownames(combat_edata) %in% R110_proteins_mut,]
+
+pheatmap(R110_imputed_mut, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+R110_proteins_unmut <- df_proteom_selected_R110_unmut$`Gene Symbol`[df_proteom_selected_R110_unmut$p_adj < 0.05& (df_proteom_selected_R110_unmut$Log2FC_R110_unmut > 0.5 |df_proteom_selected_R110_unmut$Log2FC_R110_unmut < -0.5)]
+
+R110_imputed_unmut <- combat_edata[rownames(combat_edata) %in% R110_proteins_unmut,]
+
+pheatmap(R110_imputed_unmut, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+R110_proteins_cases <- df_proteom_selected_R110_cases$`Gene Symbol`[df_proteom_selected_R110_cases$p_adj < 0.05& (df_proteom_selected_R110_cases$Log2FC_R110_cases > 0.5 |df_proteom_selected_R110_cases$Log2FC_R110_cases < -0.5)]
+
+R110_imputed_cases <- combat_edata[rownames(combat_edata) %in% R110_proteins_cases,]
+
+pheatmap(R110_imputed_cases, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+#11q
+del11q_proteins <- df_proteom_selected_11q$`Gene Symbol`[df_proteom_selected_11q$p_adj_11q < 0.05 & (df_proteom_selected_11q$Log2FC_11q > 0.5 | df_proteom_selected_11q$Log2FC_11q < -0.5)]
+
+del11q_imputed <- combat_edata[rownames(combat_edata) %in% del11q_proteins,]
+
+colAnno11q <-  colAnno2[,c("Outcome","IGHV_status","del11q")]
+
+annoCol11q <- list(Outcome = c(Progression = "red3",Indolent = "royalblue2"),
+                IGHV_status = c(mutated = "orange", unmutated = "darkgreen", Unknown = "grey"),
+                del11q = c(yes = "black",no = "grey80")
+)
+
+pheatmap(del11q_imputed, annotation_col = colAnno2, scale = "row",
+         clustering_method = "average", clustering_distance_cols = "correlation",
+         color = colorRampPalette(c("blue","white","red"))(100),annotation_colors = annoCol,
+         show_rownames = T, show_colnames = T,
+         treeheight_row = 0,border_color  = NA)
+
+
+
+#comparison with Abt_meier
+IGHV_meier <- read.table(file = "IGHV_Meier.csv", sep = ";", header = T)
+tri12_meier <- read.table(file = "Tri12_meier.csv", sep = ";", header = T)
+del11q_meier <- read.table(file = "del11q_meier.csv", sep = ";", header = T)
+IGHV_Beck <- read_excel("Supplemental table 1_Beckmann et al_1.xlsx")
+IGHV_herbst <- read_excel("sign_hits_IGHV_Herbst.xlsx")
+tri12_herbst <- read_excel("sign_hits_tri12_herbst.xlsx")
+
+CaCo_noIGHV <- CaCo_proteins[CaCo_proteins %ni% c(IGHV_proteins,IGHV_meier,IGHV_Beck)]
+#39 IGHV hits, 13/39 33% meier, 10/39 26% Beck, 4/42 10% all three, 25/39 herbst 64%
+##13/37 35% tri12 meier, 18/37 48.6% herbst, both = 13/37 35%
+#high overlap with herbst is because herbst P value is without FDR correction
+13/39
+10/39
+25/39
+13/37
+18/37
+#FDR 0.05, log2(FC) 0.5, no block for tri12 
+#19
+length(IGHV_proteins) 
+length(tri12_proteins)
+IGHV_overlap <- IGHV_meier[IGHV_meier$symbol %in% IGHV_proteins,]
+#13
+#write_xlsx(IGHV_overlap,"IGHV_overlap_meier.xlsx")
+IGHV_overlap_beck <- IGHV_Beck[IGHV_Beck$GeneName %in% IGHV_proteins,]
+#write_xlsx(IGHV_overlap_beck,"IGHV_overlap_beck.xlsx")
+#10
+IGHV_overlap_herbst <- IGHV_herbst[IGHV_herbst$Herbst == "Yes",]
+#27
+#write_xlsx(IGHV_overlap_beck,"IGHV_overlap_beck.xlsx")
+
+
+IGHV_overlap_both  <- IGHV_overlap[IGHV_overlap$symbol %in% IGHV_Beck$GeneName,]
+IGHV_overlap_three <- IGHV_overlap_both[IGHV_overlap_both$symbol!= "TCL1A",]
+#write_xlsx(IGHV_overlap_three ,"IGHV_overlap_beck_meier_herbst.xlsx")
+#herbst: FTH1, LMNA, ZAP70, FTL
+#Herbst: not TCL1A
+
+#13 old
+#25 new
+tri12_overlap <- tri12_meier[tri12_meier$symbol %in% tri12_proteins,] 
+#write_xlsx(tri12_overlap,"tri12_overlap_meier.xlsx")
+#18
+#33
+tri12_overlap_herbst <- tri12_herbst[tri12_herbst$Herbst == "Yes",]
+#write_xlsx(tri12_overlap_herbst,"tri12_overlap_herbst.xlsx")
+#13
+#24
+tri12_overlap_both <- tri12_meier[tri12_meier$symbol %in% tri12_overlap_herbst$sign_markers_tri12,] 
+#write_xlsx(tri12_overlap_both,"tri12_overlap_meier_herbst.xlsx")
+#del11q_overlap <- del11q_meier[del11q_meier$symbol %in% del11q_proteins,]
+
+for_longitudinal <- list(IGHV_overlap_both$symbol,tri12_overlap$symbol, CaCo_proteins)
+
+#saveRDS(for_longitudinal,"Proteins_longitudinal.RDS")
+
+#write_xlsx(IGHV_overlap,"IGHV_match.xlsx")
+#write_xlsx(tri12_overlap,"tri12_match.xlsx")
+
+df_proteom_selected$Match_meier <- ifelse(df_proteom_selected$`Gene Symbol` %in% IGHV_overlap$symbol,"match","no")
+df_proteom_selected$Match_beck <- ifelse(df_proteom_selected$`Gene Symbol` %in% IGHV_overlap_beck$GeneName,"match","no")
+df_proteom_selected$Match_total <- "4rest"
+df_proteom_selected$Match_total[df_proteom_selected$Match_meier == "match"] <- "1meier"
+df_proteom_selected$Match_total[df_proteom_selected$Match_beck == "match"] <- "2beck"
+df_proteom_selected$Match_total[df_proteom_selected$Match_beck == "match" &df_proteom_selected$Match_meier == "match"] <- "3total"
+table(df_proteom_selected$Match_total)
+
+
+ggplot(df_proteom_selected, aes(x = Log2FC_UM, y = -log10(p_adj_UM),color = Match_total)) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("Meier", "Beckman","both", "Rest"),values = c("red", "blue", "orange","grey")) +
+  geom_text_repel(data=subset(df_proteom_selected, Match_total != "4rest"),
+                  aes(Log2FC_UM, -log10(p_adj_UM), label = `Gene Symbol`),size = 3, color="steelblue")
+
+log2(1.3)
+
+df_proteom_selected_tri12$Match_meier <- ifelse(df_proteom_selected_tri12$`Gene Symbol` %in% tri12_overlap$symbol,"match","no")
+
+ggplot(df_proteom_selected_tri12, aes(x = Log2FC_tri12, y = -log10(p_adj_tri12),color = ifelse(Match_meier == "match","red","grey"))) +
+  geom_point() +
+  xlab(expression("Log2 Fold Change")) +
+  ylab(expression("Adjusted P value, -Log"[10]*"")) +
+  labs( color = "Threshold\n") +
+  geom_hline(
+    yintercept = c(-log10(0.05)),
+    col = "red",
+    linetype = "dotted",
+    size = 1)+
+  theme_bw() +
+  #theme(legend.position = "none")+
+  scale_colour_manual(labels = c("Rest", "Meier"),values = c("grey", "red")) +
+  geom_text_repel(data=subset(df_proteom_selected_tri12, Match_meier == "match"),
+                  aes(Log2FC_tri12, -log10(p_adj_tri12), label = `Gene Symbol`),size = 3, color="steelblue")
+
+data_summary <- function(x) {
+  m <- median(x)
+  print(m)
+  ymin <- m-IQR(x)
+  print(ymin)
+  ymax <- m+IQR(x)
+  return(c(y=m,ymin=ymin,ymax=ymax))
+}
+
+zap70_data <- df_proteom_selected[df_proteom_selected$`Gene Symbol` == "ZAP70",]
+zap70_data <- zap70_data[complete.cases(zap70_data$`Gene Symbol`),]
+zap70_individual <- dplyr::select(zap70_data ,contains("corrected_"))
+zap70_individual <- dplyr::select(zap70_individual,-contains("pool"))
+zap70_individual <- dplyr::select(zap70_individual, -paste0("corrected_",ID_long_full))
+
+transpose_zap70 <- as.data.frame(t(zap70_individual))
+colnames(transpose_zap70 ) <- "Corrected Abundances"
+vector_names <- gsub(".*_","",rownames(transpose_zap70))
+rownames(transpose_zap70) <- vector_names
+transpose_zap70$names <- rownames(transpose_zap70)
+
+
+transpose_zap70$Scaled <- scale(transpose_zap70$`Corrected Abundances`)
+rownames(transpose_zap70) <- transpose_zap70$names
+transpose_zap70 <- transpose_zap70[order(row.names(transpose_zap70)),]
+anno_zap70 <- cbind(transpose_zap70,colAnno2$IGHV_status)
+colnames(anno_zap70) <- c( "Normalized Abundances","ID", "Scaled","IGHV_status") 
+anno_zap70$FC_IGHV <- anno_zap70$`Normalized Abundances`/mean(anno_zap70$`Normalized Abundances`[anno_zap70$IGHV_status == "mutated"], na.rm= T)
+anno_zap70$zap70_combat <- combat_data$ZAP70
+anno_zap70_cmb <- anno_zap70[complete.cases(anno_zap70$`Normalized Abundances`),]
+anno_zap70_cmb$FC_unm_comb <- anno_zap70_cmb$zap70_combat / mean(anno_zap70_cmb$zap70_combat[anno_zap70_cmb$IGHV_status == "mutated"], na.rm= T)
+
+
+#remove unknown
+ggplot(anno_zap70, aes(x=IGHV_status, y=FC_IGHV, col = IGHV_status)) + ggtitle("ZAP70")+
+  geom_quasirandom(dodge.width=.2,aes(color=IGHV_status))+
+  ylab("ZAP70 FC vs mean mutated")+
+  stat_compare_means(comparisons =  list(c("mutated","unmutated")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+ggplot(anno_zap70_cmb, aes(x=IGHV_status, y=FC_unm_comb)) + ggtitle("ZAP70")+
+  geom_quasirandom(dodge.width=.2,varwidth = T,aes(color=IGHV_status, size = 1.5), show.legend = F)+
+  ylab("ZAP70 FC abundance unmutated vs mutated")+
+  stat_compare_means(comparisons =  list(c("mutated","unmutated")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+ theme_bw() +   scale_size(range = c(2.5,2.6))
+
+
+MARCKS_data <- df_proteom_selected[df_proteom_selected$`Gene Symbol` == "MARCKS",]
+MARCKS_data <- MARCKS_data[complete.cases(MARCKS_data$`Gene Symbol`),]
+MARCKS_individual <- dplyr::select(MARCKS_data ,contains("Abundances (Normalized)"))
+transpose_MARCKS <- as.data.frame(t(MARCKS_individual))
+colnames(transpose_MARCKS ) <- "Normalized Abundances"
+transpose_MARCKS$names <- rownames(transpose_MARCKS)
+transpose_MARCKS_ID <- transpose_MARCKS %>%separate(names,c("a","b","CaCo","ID"), sep = ", ")
+transpose_MARCKS_ID$a <- NULL
+transpose_MARCKS_ID$b <- NULL
+transpose_MARCKS_ID_CaCo <- transpose_MARCKS_ID[transpose_MARCKS_ID$CaCo %in% c("Case","Ctrl"),]
+transpose_MARCKS_ID_CaCo$Scaled <- scale(transpose_MARCKS_ID_CaCo$`Normalized Abundances`)
+
+rownames(transpose_MARCKS_ID_CaCo) <- transpose_MARCKS_ID_CaCo$ID
+transpose_MARCKS_ID_CaCo<- transpose_MARCKS_ID_CaCo[order(row.names(transpose_MARCKS_ID_CaCo)),]
+anno_MARCKS <- cbind(transpose_MARCKS_ID_CaCo,colAnno2$IGHV_status)
+colnames(anno_MARCKS) <- c( "Normalized Abundances", "CaCo","ID", "Scaled","IGHV_status") 
+anno_MARCKS$MARCKS_combat <- combat_data$MARCKS
+anno_MARCKS_cmb <- anno_MARCKS[complete.cases(anno_MARCKS$`Normalized Abundances`),]
+anno_MARCKS_cmb$FC_unm_comb <- anno_MARCKS_cmb$MARCKS_combat / mean(anno_MARCKS_cmb$MARCKS_combat[anno_MARCKS_cmb$IGHV_status == "unmutated"], na.rm= T)
+
+
+ggplot(anno_MARCKS, aes(x=IGHV_status, y=Scaled)) + ggtitle("MARCKS")+
+  geom_jitter(position=position_jitter(0.1))+
+  ylab("MARCKS scaled normalized abundance")+
+  stat_compare_means(comparisons =  list(c("mutated","unmutated")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+
+  stat_summary(fun.data=data_summary, 
+               geom="crossbar", width=0.3)
+
+
+
+ggplot(anno_MARCKS, aes(x=CaCo, y=Scaled)) + ggtitle("MARCKS")+
+  geom_jitter(position=position_jitter(0.1))+
+  ylab("MARCKS scaled normalized abundance")+
+  stat_compare_means(comparisons =  list(c("Case","Ctrl")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+
+  stat_summary(fun.data=data_summary, 
+               geom="crossbar", width=0.3)
+
+ggplot(anno_MARCKS_cmb, aes(x=IGHV_status, y=FC_unm_comb)) + ggtitle("MARCKS")+
+  geom_quasirandom(dodge.width=.2,varwidth = T,aes(color=IGHV_status, size = 1.5), show.legend = F)+
+  ylab("MARCKS FC abundance mutated vs unmutated")+
+  stat_compare_means(comparisons =  list(c("mutated","unmutated")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+ theme_bw() +   scale_size(range = c(2.5,2.6))
+
+
+#CaCo proteins
+#IDI1, ANXA13, THEMIS2
+CaCo_noIGHV
+
+
+THEMIS2_data <- df_proteom_selected[df_proteom_selected$`Gene Symbol` == "THEMIS2",]
+THEMIS2_data <- THEMIS2_data[complete.cases(THEMIS2_data$`Gene Symbol`),]
+THEMIS2_individual <- dplyr::select(THEMIS2_data ,contains("corrected_"))
+THEMIS2_individual <- dplyr::select(THEMIS2_individual,-contains("pool"))
+THEMIS2_individual <- dplyr::select(THEMIS2_individual, -paste0("corrected_",ID_long_full))
+
+
+transpose_THEMIS2 <- as.data.frame(t(THEMIS2_individual))
+colnames(transpose_THEMIS2 ) <- "Corrected Abundances"
+vector_names <- gsub(".*_","",rownames(transpose_THEMIS2))
+rownames(transpose_THEMIS2) <- vector_names
+transpose_THEMIS2$names <- rownames(transpose_THEMIS2)
+transpose_THEMIS2$Scaled <- scale(transpose_THEMIS2$`Corrected Abundances`)
+rownames(transpose_THEMIS2) <- transpose_THEMIS2$names
+transpose_THEMIS2 <- transpose_THEMIS2[order(row.names(transpose_THEMIS2)),]
+anno_THEMIS2 <- cbind(transpose_THEMIS2,colAnno2[,c("Outcome","IGHV_status")])
+
+
+colnames(anno_THEMIS2) <- c( "Normalized Abundances","ID", "Scaled","Outcome","IGHV_status") 
+anno_THEMIS2$FC_indol <- anno_THEMIS2$`Normalized Abundances`/mean(anno_THEMIS2$`Normalized Abundances`[anno_THEMIS2$Outcome == "Indolent"], na.rm= T)
+anno_THEMIS2$IGHV_outcome <- paste(anno_THEMIS2$Outcome,anno_THEMIS2$IGHV_status)
+anno_THEMIS2$combat_data <- combat_data$THEMIS2
+anno_THEMIS2_cmb <- anno_THEMIS2[complete.cases(anno_THEMIS2$`Normalized Abundances`),]
+anno_THEMIS2_cmb$FC_indol_comb <- anno_THEMIS2_cmb$combat_data / mean(anno_THEMIS2_cmb$combat_data[anno_THEMIS2_cmb$Outcome == "Indolent"], na.rm= T)
+
+#remove unknown
+ggplot(anno_THEMIS2, aes(x=Outcome, y=Scaled, col = Outcome)) + ggtitle("THEMIS2")+
+  geom_quasirandom(dodge.width=.2,aes(color=Outcome))+
+  ylab("THEMIS2 scaled normalized abundance")+
+  stat_compare_means(comparisons =  list(c("Progression","Indolent")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+ggplot(anno_THEMIS2, aes(x=Outcome, y=`Normalized Abundances`, col = Outcome)) + ggtitle("THEMIS2")+
+  geom_quasirandom(dodge.width=.2,aes(color=Outcome))+
+  ylab("THEMIS2 normalized abundance")+
+  stat_compare_means(comparisons =  list(c("Progression","Indolent")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+ggplot(anno_THEMIS2, aes(x=Outcome, y=FC_indol , col = Outcome)) + ggtitle("THEMIS2")+
+  geom_quasirandom(dodge.width=.2,aes(color=Outcome))+
+  ylab("THEMIS2 FC mean Indolent")+
+  stat_compare_means(comparisons =  list(c("Progression","Indolent")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+ggplot(anno_THEMIS2, aes(x=IGHV_status, y=FC_indol)) + ggtitle("THEMIS2")+
+  geom_quasirandom(dodge.width=.2,aes(color=Outcome))+
+  ylab("THEMIS2 FC mean Indolent")+
+  stat_summary(fun.data=data_summary, 
+               geom="crossbar", width=0.3)+
+  stat_compare_means(comparisons =  list(c("mutated","unmutated")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+ggplot(anno_THEMIS2, aes(x=IGHV_outcome, y=FC_indol)) + ggtitle("THEMIS2")+
+  geom_quasirandom(dodge.width=.2,varwidth = T,aes(color=Outcome, size = 1.5), show.legend = F)+
+  ylab("THEMIS2 FC mean Indolent")+ 
+   scale_color_manual(values = c("Indolent" = "blue",
+                                "Progression"="red"))+
+  stat_compare_means(comparisons =  list(c("Indolent mutated","Progression mutated"),c("Indolent mutated","Progression unmutated"),c("Progression mutated","Progression unmutated")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14)) + theme_bw() +   scale_size(range = c(2.5,2.6))
+
+ggplot(anno_THEMIS2_cmb, aes(x=IGHV_outcome, y=FC_indol_comb)) + ggtitle("THEMIS2")+
+  geom_quasirandom(dodge.width=.2,varwidth = T,aes(color=Outcome, size = 1.5), show.legend = F)+
+  ylab("THEMIS2 FC mean Indolent")+ 
+  scale_color_manual(values = c("Indolent" = "blue",
+                                "Progression"="red"))+
+  stat_compare_means(comparisons =  list(c("Indolent mutated","Progression mutated"),c("Indolent mutated","Progression unmutated"),c("Progression mutated","Progression unmutated")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14)) + theme_bw() +   scale_size(range = c(2.5,2.6))
+
+
+anno_THEMIS2$CaCo <- str_extract(anno_THEMIS2$ID, "[A-Z]+" )
+
+ggplot(anno_THEMIS2, aes(x = reorder(ID, -FC_indol), y = FC_indol, fill = CaCo)) + xlab("Patient ID")+ ylab("THEMIS2 fold change vs indolent")+
+  geom_bar(stat = "identity")+ theme(axis.text.x = element_text(size = 10,angle = 90, vjust = 0.5, hjust=1))
+
+
+mean(anno_THEMIS2$`Normalized Abundances`[anno_THEMIS2$Outcome == "Indolent"], na.rm = T)
+mean(anno_THEMIS2$`Normalized Abundances`[anno_THEMIS2$Outcome == "Progression"], na.rm = T)
+sd(anno_THEMIS2$`Normalized Abundances`[anno_THEMIS2$Outcome == "Indolent"], na.rm = T)
+mean(anno_THEMIS2$`Normalized Abundances`[anno_THEMIS2$IGHV_outcome == "Progression mutated"], na.rm = T)
+mean(anno_THEMIS2$`Normalized Abundances`[anno_THEMIS2$IGHV_outcome == "Progression unmutated"], na.rm = T)
+
+Themis2_validation <- read_excel("Themis2_WB.xlsx")
+
+Themis2_val_only <- anno_THEMIS2[anno_THEMIS2$ID %in% Themis2_validation$ID,]
+
+ggplot(Themis2_val_only, aes(x=Outcome, y=FC_indol , col = Outcome)) + ggtitle("THEMIS2")+
+  geom_quasirandom(dodge.width=.2,aes(color=Outcome))+
+  ylab("THEMIS2 FC mean Indolent")+
+  stat_compare_means(comparisons =  list(c("Progression","Indolent")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+#write_xlsx(Themis2_val_only,"Themis2_validation_samples.xlsx")
+
+IDI1_data <- df_proteom_selected[df_proteom_selected$`Gene Symbol` == "IDI1",]
+IDI1_data <- IDI1_data[complete.cases(IDI1_data$`Gene Symbol`),]
+IDI1_individual <- dplyr::select(IDI1_data ,contains("corrected_"))
+IDI1_individual <- dplyr::select(IDI1_individual,-contains("pool"))
+IDI1_individual <- dplyr::select(IDI1_individual, -paste0("corrected_",ID_long_full))
+
+transpose_IDI1 <- as.data.frame(t(IDI1_individual))
+colnames(transpose_IDI1 ) <- "Corrected Abundances"
+vector_names <- gsub(".*_","",rownames(transpose_IDI1))
+rownames(transpose_IDI1) <- vector_names
+transpose_IDI1$names <- rownames(transpose_IDI1)
+
+transpose_IDI1$Scaled <- scale(transpose_IDI1$`Corrected Abundances`)
+
+rownames(transpose_IDI1) <- transpose_IDI1$names
+transpose_IDI1 <- transpose_IDI1[order(row.names(transpose_IDI1)),]
+anno_IDI1 <- cbind(transpose_IDI1,colAnno2$Outcome)
+colnames(anno_IDI1) <- c( "Normalized Abundances","ID", "Scaled","Outcome") 
+anno_IDI1$FC_indol <- anno_IDI1$`Normalized Abundances`/mean(anno_IDI1$`Normalized Abundances`[anno_IDI1$Outcome == "Indolent"], na.rm= T)
+
+#remove unknown
+ggplot(anno_IDI1, aes(x=Outcome, y=`Normalized Abundances`, col = Outcome)) + ggtitle("IDI1")+
+  geom_quasirandom(dodge.width=.2,aes(color=Outcome))+
+  ylab("IDI1 normalized abundance")+
+  stat_compare_means(comparisons =  list(c("Progression","Indolent")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+ggplot(anno_IDI1, aes(x=Outcome, y=FC_indol , col = Outcome)) + ggtitle("IDI1")+
+  geom_quasirandom(dodge.width=.2,aes(color=Outcome))+
+  ylab("IDI1 FC mean Indolent")+
+  stat_compare_means(comparisons =  list(c("Progression","Indolent")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+ANXA13_data <- df_proteom_selected[df_proteom_selected$`Gene Symbol` == "ANXA13",]
+ANXA13_data <- ANXA13_data[complete.cases(ANXA13_data$`Gene Symbol`),]
+ANXA13_individual <- dplyr::select(ANXA13_data ,contains("corrected_"))
+ANXA13_individual <- dplyr::select(ANXA13_individual,-contains("pool"))
+ANXA13_individual <- dplyr::select(ANXA13_individual, -paste0("corrected_",ID_long_full))
+
+transpose_ANXA13 <- as.data.frame(t(ANXA13_individual))
+colnames(transpose_ANXA13 ) <- "Corrected Abundances"
+vector_names <- gsub(".*_","",rownames(transpose_ANXA13))
+rownames(transpose_ANXA13) <- vector_names
+transpose_ANXA13$names <- rownames(transpose_ANXA13)
+
+transpose_ANXA13$Scaled <- scale(transpose_ANXA13$`Corrected Abundances`)
+
+rownames(transpose_ANXA13) <- transpose_ANXA13$names
+transpose_ANXA13 <- transpose_ANXA13[order(row.names(transpose_ANXA13)),]
+anno_ANXA13 <- cbind(transpose_ANXA13,colAnno2$Outcome)
+colnames(anno_ANXA13) <- c( "Normalized Abundances","ID", "Scaled","Outcome") 
+anno_ANXA13$FC_indol <- anno_ANXA13$`Normalized Abundances`/mean(anno_ANXA13$`Normalized Abundances`[anno_ANXA13$Outcome == "Indolent"], na.rm= T)
+
+#remove unknown
+ggplot(anno_ANXA13, aes(x=Outcome, y=FC_indol, col = Outcome)) + ggtitle("ANXA13")+
+  geom_quasirandom(dodge.width=.2,aes(color=Outcome))+
+  ylab("ANXA13 normalized abundance")+
+  stat_compare_means(comparisons =  list(c("Progression","Indolent")))+
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+
+
+
+
+#TCOX model
+temp_df <- df_proteom_selected[df_proteom_selected$p_adj < 0.05 & (df_proteom_selected$Log2FC_Co_Ca > 0.5 |df_proteom_selected$Log2FC_Co_Ca < -0.5),]
+temp_df <- temp_df[complete.cases(temp_df$`Gene Symbol`),]
+temp_df_samples <- dplyr::select(temp_df,contains("corrected"))
+temp_df_samples  <- dplyr::select(temp_df_samples , -paste0("corrected_",ID_long_full))
+transpose_temp_df <- as.data.frame(t(temp_df_samples))
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"-dup")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"2")
+temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)] <- paste0(temp_df$`Gene Symbol`[duplicated(temp_df$`Gene Symbol`)],"3")
+colnames(transpose_temp_df) <- temp_df$`Gene Symbol`
+
+data_imputed <- impute.QRILC(transpose_temp_df)[[1]]
+
+for(i in 1:length(data_imputed)){
+  #get the minimum value before imputation
+  minimal_value_protein <- min(df_anova[,i],na.rm =T)
+  #get the negative values from the current column
+  neg_index <- which(data_imputed[,i] <0)
+  #replace all negative values for each protein with the minimal value before imputation
+  data_imputed[neg_index,i] <- minimal_value_protein
+}
+
+vector_names <- gsub(".*_","",rownames(data_imputed))
+
+rownames(data_imputed) <- vector_names
+Pat_char_temp <- Patient_characteristics
+rownames(Pat_char_temp ) <- Pat_char_temp$ID
+data_imputed <- data_imputed[ order(row.names(data_imputed)), ]
+Pat_char_temp <- Pat_char_temp[ order(row.names(Pat_char_temp)), ]
+Pat_char_temp$TP53_17p <- ifelse(Pat_char_temp$TP53 == "mut"|Pat_char_temp$del17p_F == 1, "yes","no")
+
+#KM analysis: use both cases and controls
+Pat_char_KM <- Pat_char_temp[,c("ID","treatment","FU_time")] 
+anno_THEMIS2_KM <- merge(anno_THEMIS2,Pat_char_KM)
+anno_THEMIS2_KM <- anno_THEMIS2_KM[complete.cases(anno_THEMIS2_KM),]
+anno_THEMIS2_KM$THEMIS2 <- ifelse(anno_THEMIS2_KM$`Normalized Abundances` >= mean(anno_THEMIS2_KM$`Normalized Abundances`), "High","Low")
+
+
+KM1 <- survfit(Surv(FU_time,treatment)~THEMIS2, data = anno_THEMIS2_KM)
+ggsurvplot(KM1, pval = T, surv.median.line = 'hv')
+
+ggsurvplot(KM1, pval = TRUE, conf.int = F, xlim = c(0,75), break.time.by = 25, xlab = 'Time (months)', ylab = 'Proportion treatment-free', risk.table = "abs_pct", risk.table.y.text = FALSE, surv.median.line = 'none', ggtheme = theme_minimal(), size=1.2, censor.size=8, font.tickslab = c(15), font.y = c(15, face = "bold"), font.x = c(15, face = "bold"), palette=c("#0F51D6", "red", "#19C1BD"))
+
+all(row.names(Pat_char_temp) == row.names(data_imputed))
+rocobj <- plot.roc(anno_THEMIS2$Outcome, anno_THEMIS2$`Normalized Abundances`, percent = TRUE, main="ROC THEMIS2", col="#1c61b6", add=FALSE,print.auc=TRUE, lwd = 4)
+optimal.cutpoint.Youden <- optimal.cutpoints(X = "Normalized Abundances", status = "Outcome" , tag.healthy = "Indolent", methods = "Youden", 
+                                             data = anno_THEMIS2, pop.prev = NULL,
+                                             control = control.cutpoints(), ci.fit = FALSE, conf.level = 0.95, trace = FALSE)
+
+optimal.cutpoint.Youden$Youden$Global$optimal.cutoff$cutoff
+optimal.cutpoint.Youden$Youden$Global$optimal.cutoff$Se
+optimal.cutpoint.Youden$Youden$Global$optimal.cutoff$Sp
+optimal.cutpoint.Youden$Youden$Global$measures.acc$AUC[1]
+
+anno_THEMIS2_M <- anno_THEMIS2[anno_THEMIS2$IGHV_status == "mutated",]
+
+rocobj <- plot.roc(anno_THEMIS2_M$Outcome, anno_THEMIS2_M$`Normalized Abundances`, percent = TRUE, main="ROC THEMIS2", col="#1c61b6", add=FALSE,print.auc=TRUE)
+optimal.cutpoint.Youden <- optimal.cutpoints(X = "Normalized Abundances", status = "Outcome" , tag.healthy = "Indolent", methods = "Youden", 
+                                             data = anno_THEMIS2_M, pop.prev = NULL,
+                                             control = control.cutpoints(), ci.fit = FALSE, conf.level = 0.95, trace = FALSE)
+optimal.cutpoint.Youden$Youden$Global$optimal.cutoff$cutoff
+optimal.cutpoint.Youden$Youden$Global$optimal.cutoff$Se
+optimal.cutpoint.Youden$Youden$Global$optimal.cutoff$Sp
+optimal.cutpoint.Youden$Youden$Global$measures.acc$AUC[1]
+
+
+data_imputed <- as.data.frame(scale(data_imputed))
+
+all(row.names(Pat_char_temp) == row.names(data_imputed))
+
+df_sign_CaCo <- read_excel("sign_hits_CaCo.xlsx")
+
+df_sign_CaCo$sign_markers
+
+temp_df_hits <- transpose_temp_df[,colnames(transpose_temp_df) %in% df_sign_CaCo$sign_markers]
+
+vector_names <- gsub(".*_","",rownames(temp_df_hits))
+rownames(temp_df_hits) <- vector_names
+temp_df_hits <- temp_df_hits[sort(row.names(temp_df_hits)),]
+temp_df_hits <- as.data.frame(scale(temp_df_hits))
+
+result_df <- data.frame("Protein" = colnames(temp_df_hits), coefficient = NA, hazard_ratio = NA, p_value = NA, CI_95 = NA  )
+
+
+for(i in 1:length(temp_df_hits)){
+  if (all(row.names(Pat_char_temp) == row.names(temp_df_hits)) == F)
+  {
+    stop("ERROR: rownames don't match")
+  }
+  temp_df_i <- cbind(Pat_char_temp,temp_df_hits[,i])
+  colnames(temp_df_i)[31] <- "protein"
+  res.cox <- coxph(Surv(FU_time, treatment) ~ IGHV_status+ TP53_17p + Batch +protein    , data = temp_df_i)
+  sum_cox <- summary(res.cox)
+  first_res <- sum_cox$coefficients["protein",c(1,2,5)]
+  second_res <- sum_cox$conf.int["protein",c(3,4)]
+  second_res <- round(second_res,2)
+  second_res <- paste(as.character(second_res[1]),as.character(second_res[2]), sep = "-")
+  total_res <- c(first_res,second_res)
+  result_df[i, c(2:5)] <- total_res 
+}
+
+result_df$p_adj <- p.adjust(result_df$p_value, method = "fdr", n = length(result_df$p_value))
+
+#write_xlsx(result_df,"results_Coxph.xlsx")
+Pat_char_temp$FU_time
+Pat_char_temp$treatment
+
+anno_THEMIS2$TP53_17p <- Pat_char_temp$TP53_17p
+anno_THEMIS2$FU_time <- Pat_char_temp$FU_time
+anno_THEMIS2$treatment <- Pat_char_temp$treatment
+anno_THEMIS2$Batch <- Pat_char_temp$Batch
+anno_THEMIS2_no_Miss <- anno_THEMIS2[complete.cases(anno_THEMIS2),]
+
+temp_df_i <- anno_THEMIS2_no_Miss
+colnames(temp_df_i)[3] <- "protein"
+res.cox <- coxph(Surv(FU_time, treatment) ~ IGHV_status+ TP53_17p + Batch + protein  , data = temp_df_i)
+sum_cox <- summary(res.cox)
+first_res <- sum_cox$coefficients["protein",c(1,2,5)]
+second_res <- sum_cox$conf.int["protein",c(3,4)]
+second_res <- round(second_res,2)
+second_res <- paste(as.character(second_res[1]),as.character(second_res[2]), sep = "-")
+total_res <- c(first_res,second_res)
+
+
+#write_xlsx(result_df,"results_Coxph.xlsx")
+#extract p-value protein and coefficient, hazard_ratio, confidence interval HR
+
+nrow(result_df[result_df$p_value < 0.05,])
+result_df[result_df$p_adjust < 0.05,]
+min(result_df$p_value)
+
+Pat_char_temp$set <- gsub("([0-9]+).*$", "\\1", Pat_char_temp$ID)
+
+table(Pat_char_temp$set)
+Id_remove <-Pat_char_temp$ID[Pat_char_temp$set %in% c("004","008","028","032","037")]
+Pat_char_temp <- Pat_char_temp[Pat_char_temp$set %ni% c("004","008","028","032","037"),]
+data_imputed <- data_imputed[rownames(data_imputed) %ni% Id_remove,]
+
+
+for(i in 1:length(data_imputed)){
+  temp_df_i <- cbind(Pat_char_temp,data_imputed[,i])
+  colnames(temp_df_i)[31] <- "protein"
+  res.cox <- clogit(treatment ~  IGHV_status+ TP53_17p + protein +strata(set)  , data = temp_df_i)
+  sum_cox <- summary(res.cox)
+  first_res <- sum_cox$coefficients["protein",c(1,2,5)]
+  second_res <- sum_cox$conf.int["protein",c(3,4)]
+  second_res <- round(second_res,2)
+  second_res <- paste(as.character(second_res[1]),as.character(second_res[2]), sep = "-")
+  total_res <- c(first_res,second_res)
+  result_df[i, c(2:5)] <- total_res 
+}
+
+IGHV_proteins <- df_proteom_selected$`Gene Symbol`[df_proteom_selected$p_adj_UM < 0.05 & (df_proteom_selected$Log2FC_UM > 0.5 |df_proteom_selected$Log2FC_UM < -0.5)]
+IGHV_p_val <- df_proteom_selected$p_adj_UM[df_proteom_selected$p_adj_UM < 0.05 & (df_proteom_selected$Log2FC_UM > 0.5 |df_proteom_selected$Log2FC_UM < -0.5)]
+IGHV_Log2FC <- df_proteom_selected$Log2FC_UM[df_proteom_selected$p_adj_UM < 0.05 & (df_proteom_selected$Log2FC_UM > 0.5 |df_proteom_selected$Log2FC_UM < -0.5)]
+IGHV_df <- data.frame("Gene.symbol" = IGHV_proteins, "logFC" =IGHV_Log2FC , "adj.P.Val" = IGHV_p_val)
+IGHV_output <- run_pathfindR(IGHV_df,output_dir = "IGHV")
+term_gene_graph(result_df = IGHV_output, use_description = TRUE)
+enrichment_chart(IGHV_output)
+
+tri12_proteins <-  df_proteom_selected_tri12$`Gene Symbol`[df_proteom_selected_tri12$p_adj_tri12   < 0.05 & (df_proteom_selected_tri12$Log2FC_tri12 > 0.5 |df_proteom_selected_tri12$Log2FC_tri12 < -0.5)]
+tri12_p_val <- df_proteom_selected_tri12$p_adj_tri12[df_proteom_selected_tri12$p_adj_tri12   < 0.05 & (df_proteom_selected_tri12$Log2FC_tri12 > 0.5 |df_proteom_selected_tri12$Log2FC_tri12 < -0.5)]
+tri12_Log2FC <- df_proteom_selected_tri12$Log2FC_tri12[df_proteom_selected_tri12$p_adj_tri12 < 0.05 & (df_proteom_selected_tri12$Log2FC_tri12 > 0.5 |df_proteom_selected_tri12$Log2FC_tri12 < -0.5)]
+tri12_df <- data.frame("Gene.symbol" = tri12_proteins, "logFC" =tri12_Log2FC , "adj.P.Val" = tri12_p_val)
+tri12_output <- run_pathfindR(tri12_df,output_dir = "tri12")
+term_gene_graph(result_df = tri12_output, use_description = TRUE)
+enrichment_chart(tri12_output)
+
